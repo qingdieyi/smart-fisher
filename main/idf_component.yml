@@ -1,0 +1,31 @@
+## ═══════════════════════════════════════════════════════════════════
+# ESP-IDF 组件依赖声明 — idf_component.yml
+#
+# ── 这是什么？ ───────────────────────────────────────────────────
+#
+# 这个文件告诉 ESP-IDF 组件管理器（Component Manager）：
+#   "我们需要以下第三方组件，请在构建时自动下载"
+#
+# ── Java 类比 ─────────────────────────────────────────────────────
+#
+#   这个文件相当于 Maven 的 pom.xml 中的 <dependencies> 块，
+#   或者 Gradle 的 build.gradle 中的 dependencies { }。
+#
+#   idf_component.yml     →  类似 pom.xml
+#   espressif/esp32-camera →  类似 groupId:artifactId
+#   ^2.0.0                →  类似 version 约束（兼容 2.x）
+#
+# ── 怎么工作？ ────────────────────────────────────────────────────
+#
+#   1. 你写 idf_component.yml 声明依赖
+#   2. idf.py build 时，组件管理器自动下载依赖到 managed_components/
+#   3. 编译时自动将 managed_components/ 加入头文件路径
+#   4. CMake 自动链接所需的库
+#
+#   这一切都是自动的，不需要手动 git clone 或复制文件。
+#
+# ═══════════════════════════════════════════════════════════════════
+
+dependencies:
+  espressif/esp32-camera:
+    version: "^2.0.0"     # 兼容 2.0.0 ~ 2.x 的任意版本

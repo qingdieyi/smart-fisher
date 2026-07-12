@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════════════════════════
+# 项目配置菜单 — Kconfig.projbuild
+#
+# ── 这是什么？ ───────────────────────────────────────────────────
+#
+# Kconfig 是 Linux 内核使用的配置系统，ESP-IDF 继承了它。
+# 这个文件定义了运行 `idf.py menuconfig` 时看到的配置界面。
+#
+# ── 给 Java 开发者 ───────────────────────────────────────────────
+#
+#   Java 概念                       Kconfig 对应
+#   ──────────────────────────────────────────────────────────────
+#   application.yml 中的配置项       Kconfig 中的 config 项
+#   配置项的类型（String/int/bool）  Kconfig 的 string/int/bool 关键字
+#   @ConfigurationProperties        menuconfig 界面的菜单
+#   配置项的 default 值              default 关键字
+#   IDE 的配置提示                   help 块
+#
+# ── 怎么用 ───────────────────────────────────────────────────────
+#
+#   1. 运行 `idf.py menuconfig`
+#   2. 进入 "Example Configuration" 菜单
+#   3. 修改 SSID 和密码
+#   4. 保存退出 → 自动生成 sdkconfig 文件
+#
+#   注意：sdkconfig 是运行时生成的，不要手动编辑。
+#   如果要设默认值，改 sdkconfig.defaults 文件。
+#
+# ═══════════════════════════════════════════════════════════════════
+
+menu "Example Configuration"
+    # menu = 创建一个菜单子项（类似配置页面的一个 tab）
+
+    config EXAMPLE_WIFI_SSID
+        string "WiFi SSID"
+        # config 定义一个配置项
+        # string = 值的类型是字符串
+        # "WiFi SSID" = 在菜单中显示的标签
+        default "yang"
+        # default = 默认值（当 sdkconfig 中还没有这个配置项时使用）
+        help
+            SSID (network name) for the example to connect to.
+
+    config EXAMPLE_WIFI_PASSWORD
+        string "WiFi Password"
+        default "yang123456"
+        help
+            WiFi password (WPA2-PSK).
+
+endmenu

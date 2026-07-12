@@ -1,0 +1,22 @@
+# ESP-IDF build output
+build/
+managed_components/
+dependencies.lock
+
+# IDE
+.idea/
+*.iml
+
+# sdkconfig (auto-generated, personal overrides)
+sdkconfig
+sdkconfig.old
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ESP-IDF
+*.pyc
+__pycache__/

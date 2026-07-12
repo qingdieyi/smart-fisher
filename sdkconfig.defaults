@@ -1,0 +1,76 @@
+# ═══════════════════════════════════════════════════════════════════
+# SDK 配置默认值 — sdkconfig.defaults
+#
+# ── 这是什么？ ───────────────────────────────────────────────────
+#
+# 这个文件为 Kconfig 配置项提供"出厂默认值"。
+#
+# sdkconfig 的三个层次：
+#
+#   1. Kconfig 文件（项目 + ESP-IDF）
+#      → 定义了哪些配置项存在、它们的类型和默认值
+#
+#   2. sdkconfig.defaults（就是这个文件）
+#      → 覆盖 Kconfig 中 hardcoded 的 default 值
+#      → 提交到 git，团队成员共享
+#
+#   3. sdkconfig（自动生成，不提交 git）
+#      → 运行 menuconfig 后生成的最终配置
+#      → 包含你个人修改的值
+#
+# ── Java 类比 ─────────────────────────────────────────────────────
+#
+#   层次                         Java 对应
+#   ────────────────────────────────────────────────────────────────
+#   Kconfig (ESP-IDF 默认)      库的默认配置（如 Spring Boot 的默认值）
+#   sdkconfig.defaults           application.yml（项目级别默认值）
+#   sdkconfig                    application-dev.yml（个人覆盖，不进 git）
+#
+# ═══════════════════════════════════════════════════════════════════
+
+# ── WiFi 配置 ─────────────────────────────────────────────────────
+
+# WiFi 网络名称（SSID）
+CONFIG_EXAMPLE_WIFI_SSID="yang"
+
+# WiFi 密码
+CONFIG_EXAMPLE_WIFI_PASSWORD="yang123456"
+
+# 使用 WPA2-PSK 认证模式（最常见的家用 WiFi 加密）
+CONFIG_EXAMPLE_WPA2_ENTERPRISE=n
+
+# ── PSRAM 配置（摄像头必须！） ────────────────────────────────────
+#
+# ESP32-S3-CAM R16N8 有 8MB Octal PSRAM
+# R16N8 = R(PSRAM) + 16(16MB Flash) + N(Octal) + 8(8MB PSRAM)
+#
+# 摄像头帧缓冲必须放在 PSRAM 中 —— 内部 SRAM 只有 512KB 不够用
+# 如果不开启 PSRAM，esp_camera_init() 会返回 ESP_ERR_NO_MEM
+
+# 启用 PSRAM（SPIRAM = SPI PSRAM）
+CONFIG_SPIRAM=y
+
+# PSRAM 模式：Octal SPI（ESP32-S3 支持，比 Quad 快一倍）
+CONFIG_SPIRAM_MODE_OCT=y
+
+# PSRAM 速度：80MHz（和参考程序一致）
+CONFIG_SPIRAM_SPEED_80M=y
+
+# 将 PSRAM 加入 malloc 分配池
+# 这样 camera 组件可以通过 heap_caps_malloc(..., MALLOC_CAP_SPIRAM) 分配帧缓冲
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# 不允许 BSS 段放 PSRAM（和参考程序一致，避免初始化顺序问题）
+# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is not set
+
+# SCCB (I²C) 时钟频率 — 最低 100kHz，提高稳定性
+CONFIG_SCCB_CLK_FREQ=100000
+
+# ── 其他可配置项（后续阶段会用到） ──────────────────────────────────
+
+# MQTT Broker 地址
+# CONFIG_BROKER_URI="mqtt://broker.emqx.io"
+
+# 开启 Task Watchdog（任务看门狗 — 如果任务卡死超 10 秒，自动重启）
+# CONFIG_ESP_TASK_WDT=y
+# CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
