@@ -66,10 +66,11 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # SCCB (I²C) 时钟频率 — 最低 100kHz，提高稳定性
 CONFIG_SCCB_CLK_FREQ=100000
 
-# ── 其他可配置项（后续阶段会用到） ──────────────────────────────────
+# ── MQTT 配置 ──────────────────────────────────────────────────────
 
-# MQTT Broker 地址
-# CONFIG_BROKER_URI="mqtt://broker.emqx.io"
+# MQTT Broker 地址（公共测试 Broker，免费无需注册）
+# 取消注释以覆盖默认值:
+# CONFIG_BROKER_URI="mqtt://broker.emqx.io:1883"
 
 # 开启 Task Watchdog（任务看门狗 — 如果任务卡死超 10 秒，自动重启）
 # CONFIG_ESP_TASK_WDT=y

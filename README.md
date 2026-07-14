@@ -26,16 +26,22 @@
 
 ## 功能
 
-### 已完成 (Phase 1 + 2)
+### 已完成 (Phase 1 ~ 5)
 
 - ✅ WiFi WPA2-PSK 连接 (自动重连, 最多 5 次失败后重启)
 - ✅ DS18B20 温度采集 (12-bit 精度, 0.0625°C, 每 5 秒)
 - ✅ OV5640 摄像头拍照 (800×600 JPEG, 硬件编码, 每 60 秒)
+- ✅ MQTT 数据上报 (broker.emqx.io 公共 Broker, JSON + JPEG)
+- ✅ 鱼群检测 — 帧差法运动检测 (连通域分析, 计数 + 活跃度)
 
-### 待开发
+### MQTT Topics
 
-- ⬜ MQTT 数据上报 (Phase 3)
-- ⬜ 鱼群检测 — 帧差法运动检测 (Phase 4)
+| Topic | QoS | 说明 |
+|-------|-----|------|
+| `smart-fisher/{id}/temperature` | 0 | 水温 JSON |
+| `smart-fisher/{id}/fish_status` | 0 | 鱼群状态 JSON |
+| `smart-fisher/{id}/image` | 1 | 鱼缸照片 JPEG |
+| `smart-fisher/{id}/status` | 1 | 设备状态 JSON (retained) |
 
 ## 快速开始
 
@@ -78,12 +84,14 @@ idf.py menuconfig → Example Configuration
 ```
 smart-fisher/
 ├── main/
-│   ├── main.c                 # 入口 — WiFi + 温度任务 + 摄像头任务
-│   ├── ds18b20.h / ds18b20.c  # DS18B20 1-Wire 位拆裂驱动（零外部依赖）
-│   ├── camera_handler.h / .c  # OV5640 摄像头封装（依赖 esp32-camera 组件）
-│   ├── idf_component.yml      # 组件依赖声明 (espressif/esp32-camera ^2.0.0)
-│   ├── CMakeLists.txt         # 源文件 + 编译依赖
-│   └── Kconfig.projbuild      # menuconfig 配置项
+│   ├── main.c                   # 入口 — WiFi + 温度任务 + 摄像头任务 + MQTT
+│   ├── ds18b20.h / ds18b20.c    # DS18B20 1-Wire 位拆裂驱动（零外部依赖）
+│   ├── camera_handler.h / .c    # OV5640 摄像头封装（依赖 esp32-camera 组件）
+│   ├── mqtt_handler.h / .c      # MQTT 数据上报（依赖 esp_mqtt）
+│   ├── fish_detector.h / .c     # 鱼群帧差法检测（依赖 esp_jpeg）
+│   ├── idf_component.yml        # 组件依赖声明 (espressif/esp32-camera ^2.0.0)
+│   ├── CMakeLists.txt           # 源文件 + 编译依赖
+│   └── Kconfig.projbuild        # menuconfig 配置项
 ├── docs/
 │   ├── brd.md                 # 原始需求文档
 │   ├── development-plan.md    # 完整开发方案 + 调试实录
@@ -97,12 +105,14 @@ smart-fisher/
 
 ```
 app_main()
-  ├─ nvs_flash_init()            → NVS 存储初始化
-  ├─ wifi_init_sta()             → WPA2-PSK 连接
-  ├─ ds18b20_init(GPIO1)         → 温度传感器初始化
-  ├─ xTaskCreate(temp_task)       → 温度任务 (5s 间隔, 优先级 3)
-  ├─ xTaskCreate(camera_task)     → 摄像头任务 (60s 间隔, 优先级 2)
-  └─ 主循环空闲
+  ├─ nvs_flash_init()              → NVS 存储初始化
+  ├─ wifi_init_sta()               → WPA2-PSK 连接
+  ├─ mqtt_handler_init()           → MQTT 客户端 (broker.emqx.io:1883)
+  ├─ ds18b20_init(GPIO1)           → 温度传感器初始化
+  ├─ fish_detector_init()          → 鱼群检测器初始化
+  ├─ xTaskCreate(temp_task)         → 温度任务 (5s, prio 3) + MQTT 上报
+  ├─ xTaskCreate(camera_task)       → 摄像头任务 (60s, prio 2) + 鱼群检测 + MQTT 上报
+  └─ 主循环 — 定期上报设备状态 (60s)
 ```
 
 ## 调试日志示例
@@ -110,7 +120,10 @@ app_main()
 ```
 I (7342) camera: Detected OV5640 camera
 I (8482) camera: Camera initialized successfully!
-I (10492) smart-fisher: 📷 Photo: 320x240, 4639 bytes
+I (10492) smart-fisher: 📷 Photo: 800x600, 15420 bytes, ts=123456ms
+I (10520) fish-detector: 🐟 Detection: 3 fish, activity=moderate (score=12%, motion_pixels=900) [65 ms]
+I (10530) mqtt: Published to smart-fisher/A1B2C3/fish_status (98 bytes, msg_id=12345)
+I (10531) mqtt: Published binary to smart-fisher/A1B2C3/image (15420 bytes, msg_id=12346)
 I (13762) smart-fisher: 🌡️  Water Temperature: 29.00 °C
 ```
 

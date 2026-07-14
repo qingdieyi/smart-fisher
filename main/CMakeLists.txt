@@ -26,7 +26,7 @@
 idf_component_register(
     # SRCS: 源文件列表（类似 Maven 的 <sourceDirectory>）
     #       列出所有要编译的 .c 文件
-    SRCS "main.c" "ds18b20.c" "camera_handler.c"
+    SRCS "main.c" "ds18b20.c" "camera_handler.c" "mqtt_handler.c" "fish_detector.c"
 
     # INCLUDE_DIRS: 头文件搜索路径
     #               "." 表示当前目录，这样 #include "ds18b20.h" 就能找到
@@ -42,7 +42,7 @@ idf_component_register(
     #     - esp_driver_gpio: GPIO 驱动（ESP-IDF v6.0 拆分出的独立组件）
     #     - esp32-camera:   OV5640 摄像头驱动（来自 Component Registry）
     #     - esp_timer:      高精度定时器（获取拍照时间戳）
-    #
-    #   后续阶段会添加：esp_mqtt 等
-    PRIV_REQUIRES esp_wifi nvs_flash esp_driver_gpio esp32-camera esp_timer
+    #     - esp_mqtt:       MQTT 客户端（数据上报到云端 Broker）
+    #     - esp_jpeg:       JPEG 解码器（鱼群检测需要解码照片）
+    PRIV_REQUIRES esp_wifi nvs_flash esp_driver_gpio esp32-camera esp_timer esp_mqtt esp_jpeg
 )

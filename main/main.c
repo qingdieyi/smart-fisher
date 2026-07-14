@@ -29,10 +29,17 @@
  *
  * ── 当前阶段 ────────────────────────────────────────────────────────
  *
- *   ✅ Phase 1 完成 — WiFi (WPA2-PSK) + DS18B20 温度采集
- *   ⬜ Phase 2 — 摄像头 (OV5640)
- *   ⬜ Phase 3 — MQTT 上报
- *   ⬜ Phase 4 — 鱼群检测
+ *   ✅ Phase 1 完成 — WiFi (WPA2-PSK)
+ *   ✅ Phase 2 完成 — DS18B20 温度采集
+ *   ✅ Phase 3 完成 — 摄像头 (OV5640)
+ *   ✅ Phase 4 完成 — MQTT 上报 (broker.emqx.io)
+ *   ✅ Phase 5 完成 — 鱼群检测 (帧差法)
+ *
+ *   MQTT Topics:
+ *     smart-fisher/{device_id}/temperature   — 水温 (JSON)
+ *     smart-fisher/{device_id}/fish_status   — 鱼群状态 (JSON)
+ *     smart-fisher/{device_id}/image         — 鱼缸照片 (JPEG)
+ *     smart-fisher/{device_id}/status        — 设备状态 (JSON)
  */
 
 /* ── 头文件引入 ─────────────────────────────────────────────────── */
@@ -53,10 +60,13 @@
                                * ESP32 用 Flash 的一部分来模拟"键值对存储"，
                                * WiFi 凭证就存在这里 */
 #include "esp_netif.h"        /* 网络接口抽象层（类似 Java 的 NetworkInterface） */
+#include "esp_timer.h"        /* 高精度定时器 — 获取系统运行时间 */
 
 /* 我们自己写的模块 */
 #include "ds18b20.h"           /* DS18B20 温度传感器驱动 */
 #include "camera_handler.h"    /* OV5640 摄像头驱动 */
+#include "mqtt_handler.h"      /* MQTT 数据上报 */
+#include "fish_detector.h"     /* 鱼群运动检测 */
 
 /* ═══════════════════════════════════════════════════════════════════
  * 配置常量
@@ -91,6 +101,12 @@
  * 正式部署改为 300000（5 分钟），减少功耗和上传流量。
  */
 #define CAMERA_CAPTURE_INTERVAL_MS  60000   /* 60 秒 = 1 分钟 */
+
+/*
+ * 设备状态上报间隔（毫秒）。
+ * 每 60 秒上报一次设备健康状态。
+ */
+#define STATUS_PUBLISH_INTERVAL_MS  60000   /* 60 秒 */
 
 /* ═══════════════════════════════════════════════════════════════════
  * 全局变量
@@ -349,7 +365,8 @@ static void wifi_init_sta(void)
  *   1. 等待 WiFi 连接
  *   2. 初始化 OV5640 摄像头（配置寄存器、启动数据流）
  *   3. 每隔 CAMERA_CAPTURE_INTERVAL_MS 毫秒拍一张照片
- *   4. 打印照片信息（大小、分辨率、时间戳）
+ *   4. 用帧差法检测鱼群活动（Phase 5）
+ *   5. 上报鱼群状态和照片到 MQTT（Phase 4）
  *
  * ── 为什么任务优先级低于温度任务？ ─────────────────────────────────
  *
@@ -368,13 +385,16 @@ static void wifi_init_sta(void)
  *     - esp_camera_fb_get() 内部有深调用栈（传感器驱动 → DMA 管理）
  *     - camera_frame_t 结构体（虽然用堆/PSRAM，但函数调用也要栈）
  *     - ESP_LOGI 等日志函数也有栈开销
+ *     - 新增：fish_detector_analyze() 的 JPEG 解码调用栈
  *   8KB 是比较安全的值。如果栈溢出，日志会看到 "Stack canary" 错误。
  *
  * Java 类比：
  *   @Scheduled(fixedDelay = 60000)
- *   public void capturePhoto() {
+ *   public void captureAndAnalyze() {
  *       CameraFrame frame = camera.takePicture();
- *       log.info("Photo: {} bytes", frame.getSize());
+ *       FishResult fish = fishDetector.analyze(frame.getJpeg());
+ *       mqttClient.publish("fish_status", fish.toJson());
+ *       mqttClient.publish("image", frame.getJpeg());
  *   }
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -432,39 +452,24 @@ static void camera_task(void *pvParameters)
     }
 
     /*
-     * ── 第 3 步：拍照循环 ──
+     * ── 第 3 步：拍照 + 检测 + 上报循环 ──
      *
-     * 定时拍照 → 打印信息 → 释放帧 → 延时 → 重复。
+     * 每次循环：
+     *   1. 拍一张 JPEG 照片（~200ms）
+     *   2. 用帧差法检测鱼群活动（~50-80ms）
+     *   3. 上报鱼群状态到 MQTT
+     *   4. 上报照片到 MQTT
+     *   5. 释放帧缓冲
+     *   6. 等待下一个周期
      *
-     * 当前阶段（Phase 2）只做拍照 + 串口输出，
-     * 后续 Phase 4 会加上 MQTT 上传，
-     * Phase 5 会加上鱼群检测。
+     * 全流程约 100~500ms，不影响 60s 拍照周期。
      */
     while (1) {
-        /*
-         * ── 拍照 ──
-         *
-         * camera_capture() 是阻塞的：
-         *   - 等传感器曝光完成
-         *   - 读 JPEG 字节流
-         *   - 填充 camera_frame_t
-         * 整个过程约 100~300ms。
-         */
+        /* ── 拍照 ── */
         camera_frame_t frame;
         ret = camera_capture(&frame);
 
         if (ret == ESP_OK) {
-            /*
-             * ── 打印照片信息 ──
-             *
-             * 后续阶段会改为：
-             *   mqtt_publish_image(frame.buf, frame.len, frame.timestamp_ms);
-             *
-             * 现在只是串口输出，验证拍照功能正常。
-             *
-             * 输出示例：
-             *   📷 Photo: 800x600, 15420 bytes, ts=123456ms
-             */
             ESP_LOGI(TAG, "📷 Photo: %dx%d, %u bytes, ts=%lld ms",
                      (unsigned int)frame.width,
                      (unsigned int)frame.height,
@@ -472,38 +477,67 @@ static void camera_task(void *pvParameters)
                      (long long)frame.timestamp_ms);
 
             /*
-             * ── 释放帧缓冲 ──
+             * ── 鱼群检测（Phase 5）──
              *
-             * 忘记调用 camera_frame_release() 的后果：
-             *   - 第 1 次拍照：正常
-             *   - 第 2 次拍照：正常（双缓冲机制）
-             *   - 第 3 次拍照：可能阻塞或失败（PSRAM 帧缓冲耗尽）
+             * 用帧差法分析 JPEG 照片中的鱼群活动。
+             * 第一次调用时建立参考帧（结果为 unknown），
+             * 后续调用与参考帧对比得出鱼数量和活跃度。
              *
-             * 在嵌入式 C 中，内存泄漏不会像 Java 那样最终被 GC 回收。
-             * 8MB PSRAM 看起来很大，但忘记释放 = 肯定会累积泄漏。
-             *
-             * Java 类比：
-             *   frame.release();  // !!! 忘记这行 = 内存泄漏 !!!
+             * 检测耗时约 50~80ms（JPEG 解码 + 差分 + 连通域分析）。
              */
+            fish_result_t fish;
+            esp_err_t detect_ret = fish_detector_analyze(
+                frame.buf, frame.len, &fish);
+
+            /*
+             * ── 上报鱼群状态到 MQTT（Phase 4）──
+             *
+             * Topic: smart-fisher/{device_id}/fish_status
+             * Payload 示例:
+             *   {"fish_count":3,"motion_score":12,"activity":"moderate","timestamp":123456}
+             */
+            if (detect_ret == ESP_OK && mqtt_is_connected()) {
+                char fish_topic[160];
+                char payload[256];
+                snprintf(fish_topic, sizeof(fish_topic),
+                         "smart-fisher/%s/fish_status",
+                         mqtt_get_device_id());
+                snprintf(payload, sizeof(payload),
+                         "{\"fish_count\":%d,"
+                         "\"motion_score\":%d,"
+                         "\"activity\":\"%s\","
+                         "\"timestamp\":%lld}",
+                         fish.fish_count,
+                         fish.motion_score,
+                         fish.activity,
+                         (long long)frame.timestamp_ms);
+                mqtt_publish(fish_topic, payload, 0, 0);
+            }
+
+            /*
+             * ── 上报照片到 MQTT（Phase 4）──
+             *
+             * Topic: smart-fisher/{device_id}/image
+             * Payload: JPEG 二进制数据
+             * QoS 1 确保照片送达。
+             *
+             * 单帧约 10~30KB，MQTT 默认最大 payload 256KB。
+             */
+            if (mqtt_is_connected()) {
+                char img_topic[160];
+                snprintf(img_topic, sizeof(img_topic),
+                         "smart-fisher/%s/image",
+                         mqtt_get_device_id());
+                mqtt_publish_binary(img_topic, frame.buf, frame.len, 1);
+            }
+
+            /* ── 释放帧缓冲 ── */
             camera_frame_release(&frame);
         } else {
-            /*
-             * ── 拍照失败处理 ──
-             *
-             * 运行中的偶发失败通常是瞬时干扰（DMA 总线冲突等），
-             * 不尝试重新初始化，等下一个周期自动恢复。
-             * 如果连续失败 → 看门狗会重启 → 重新走完整初始化。
-             */
             ESP_LOGW(TAG, "Photo capture failed (err=0x%X), will retry next cycle.",
                      (unsigned int)ret);
         }
 
-        /*
-         * ── 等待下一个拍照周期 ──
-         *
-         * vTaskDelay 让任务进入 Blocked 状态，释放 CPU 给其他任务。
-         * 这不是忙等（busy-wait）—— CPU 同时执行温度读取、WiFi 维护等。
-         */
         vTaskDelay(pdMS_TO_TICKS(CAMERA_CAPTURE_INTERVAL_MS));
     }
 }
@@ -524,6 +558,12 @@ static void camera_task(void *pvParameters)
  *   优先级            Thread.setPriority()     创建时指定（数字越大优先级越高）
  *   终止              Thread.interrupt()       函数 return 或 vTaskDelete(NULL)
  *   返回值            Future.get()             无（通过 Queue/EventGroup 通信）
+ *
+ * ── Phase 4 变更 ─────────────────────────────────────────────────
+ *
+ *   现在每次读取温度后，自动上报到 MQTT：
+ *     Topic: smart-fisher/{device_id}/temperature
+ *     QoS 0（丢了等 5 秒下一包）
  * ═══════════════════════════════════════════════════════════════════ */
 
 static void temperature_task(void *pvParameters)
@@ -567,10 +607,7 @@ static void temperature_task(void *pvParameters)
      *   @Scheduled(fixedDelay = 5000)  // Spring 的定时任务
      *   public void readTemperature() { ... }
      *
-     * 与 Java 定时任务的区别：
-     *   - 没有框架帮你管理调度，需要自己写 while(1) 循环
-     *   - vTaskDelay 会出让 CPU 给其他任务，不是忙等（busy-wait）
-     *   - 如果要把数据发给手机看，这里会 publish 到 MQTT（后续阶段实现）
+     * 现在每次读取后自动上报到 MQTT。
      */
     while (1) {
         /*
@@ -584,20 +621,30 @@ static void temperature_task(void *pvParameters)
         esp_err_t ret = ds18b20_read_temperature(pin, &temperature);
 
         if (ret == ESP_OK) {
-            /*
-             * %.2f = 浮点数，保留 2 位小数
-             * 输出示例：🌡️  Water Temperature: 25.50 °C
-             */
             ESP_LOGI(TAG, "🌡️  Water Temperature: %.2f °C", temperature);
-        } else {
+
             /*
-             * 读取失败不崩溃 —— 这次读不到，5秒后再试。
-             * 这体现了嵌入式系统的"容错设计"：单个操作的失败
-             * 不应该导致整个系统挂掉。
+             * ── 上报温度到 MQTT（Phase 4）──
              *
-             * 0x%X = 以十六进制打印错误码
-             * 输出示例：Temperature read failed (err=0x103), retrying...
+             * Topic: smart-fisher/{device_id}/temperature
+             * Payload 示例: {"temperature":25.50,"unit":"celsius","timestamp":123456}
+             * QoS 0（温度数据丢了等 5 秒就有下一包）
              */
+            if (mqtt_is_connected()) {
+                char temp_topic[160];
+                char payload[128];
+                snprintf(temp_topic, sizeof(temp_topic),
+                         "smart-fisher/%s/temperature",
+                         mqtt_get_device_id());
+                snprintf(payload, sizeof(payload),
+                         "{\"temperature\":%.2f,"
+                         "\"unit\":\"celsius\","
+                         "\"timestamp\":%lld}",
+                         temperature,
+                         (long long)(esp_timer_get_time() / 1000));
+                mqtt_publish(temp_topic, payload, 0, 0);
+            }
+        } else {
             ESP_LOGW(TAG, "Temperature read failed (err=0x%X), retrying...",
                      (unsigned int)ret);
         }
@@ -609,7 +656,7 @@ static void temperature_task(void *pvParameters)
          * 默认配置：1 tick = 10ms → 5000ms = 500 ticks
          *
          * 注意：vTaskDelay 让任务进入 Blocked 状态整整 5 秒。
-         * 期间 CPU 可以执行其他任务（如 WiFi 重连、后续的 MQTT 等）。
+         * 期间 CPU 可以执行其他任务（如 WiFi 重连、MQTT 等）。
          * 这就叫 "非阻塞延时"。
          */
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -629,8 +676,10 @@ static void temperature_task(void *pvParameters)
  * main 函数的工作顺序非常重要，类似 Spring Boot 的启动流程：
  *   1. 初始化底层（NVS、WiFi）
  *   2. 连接网络
- *   3. 初始化外设（传感器）
- *   4. 启动业务任务
+ *   3. 初始化 MQTT（Phase 4 — 新增）
+ *   4. 初始化外设（传感器、鱼群检测器）
+ *   5. 启动业务任务
+ *   6. 主循环：定期上报设备状态
  * ═══════════════════════════════════════════════════════════════════ */
 
 void app_main(void)
@@ -703,48 +752,52 @@ void app_main(void)
                         pdFALSE, pdTRUE, portMAX_DELAY);
 
     /* ═════════════════════════════════════════════════════════════
-     * 阶段 3：传感器初始化
+     * 阶段 3：MQTT 初始化（Phase 4 — 新增）
+     *
+     * MQTT 客户端在后台异步连接 Broker。
+     * 连接成功后，其他任务就可以通过 mqtt_publish() 上报数据。
+     * ═════════════════════════════════════════════════════════════ */
+
+    ret = mqtt_handler_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT init failed (err=0x%X). "
+                 "Data upload will be disabled.", (unsigned int)ret);
+    }
+
+    /* ═════════════════════════════════════════════════════════════
+     * 阶段 4：传感器和检测器初始化
      * ═════════════════════════════════════════════════════════════ */
 
     ret = ds18b20_init(TEMP_SENSOR_GPIO);
     if (ret != ESP_OK) {
-        /*
-         * 传感器初始化失败，打印错误但程序继续运行。
-         *
-         * 为什么不像 Java 那样抛出异常？
-         *   在嵌入式系统中，"一个外设坏了"不应该让整个系统停摆。
-         *   传感器可能晚点才插上（热插拔），WiFi 连接和后续的摄像头
-         *   功能都不依赖温度传感器。
-         *
-         * 这是一种"优雅降级"（Graceful Degradation）的设计理念：
-         *   传感器坏了 → 日志报错 → 温度任务会持续重试 → 但程序不挂
-         */
         ESP_LOGE(TAG, "DS18B20 init failed. Check wiring and GPIO %d.",
                  (int)TEMP_SENSOR_GPIO);
     }
 
+    /*
+     * ── 初始化鱼群检测器（Phase 5 — 新增）──
+     *
+     * 分配检测所需的缓冲区（灰度参考帧、运动标记图等，约 40KB）。
+     * 必须在摄像头任务开始拍照前调用。
+     */
+    ret = fish_detector_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Fish detector init failed (err=0x%X). "
+                 "Fish detection will be disabled.", (unsigned int)ret);
+    }
+
     /* ═════════════════════════════════════════════════════════════
-     * 阶段 4：启动业务任务
+     * 阶段 5：启动业务任务
      *
      * xTaskCreate() = 创建并启动一个 FreeRTOS 任务
      *
      * 参数说明（按顺序）：
      *   1. temperature_task   — 任务函数（相当于 Java 的 Runnable.run()）
      *   2. "temp_task"        — 任务名称（用于调试和 ps 命令查看）
-     *   3. 4096               — 栈大小（字节），类似 Thread 构造函数中的 stackSize
-     *                           4096 字节对于温度读取来说足够了。
-     *                           如果不够 → StackOverflow → 看门狗复位
+     *   3. 4096               — 栈大小（字节）
      *   4. (void*)(uintptr_t)TEMP_SENSOR_GPIO — 传给任务的参数（GPIO 引脚号）
      *   5. 3                  — 优先级（数字越大优先级越高，0 最低）
      *   6. NULL               — 任务句柄（不需要保存，传 NULL）
-     *
-     * Java 类比：
-     *   Thread tempThread = new Thread(
-     *       () -> temperatureTask.run(),
-     *       "temp_task"
-     *   );
-     *   tempThread.setPriority(Thread.NORM_PRIORITY);  // Java 里越低越优先
-     *   tempThread.start();
      * ═════════════════════════════════════════════════════════════ */
 
     xTaskCreate(temperature_task, "temp_task", 4096,
@@ -753,34 +806,67 @@ void app_main(void)
     /*
      * ── 创建摄像头任务 ──
      *
-     * 栈大小 8192 字节（8KB）—— 因为 camera_capture() 调用链较深
-     * （esp_camera_fb_get → DMA 管理 → JPEG 解码），需要更多栈空间。
+     * 栈大小 8192 字节（8KB）—— 因为增加了 fish_detector_analyze() 的
+     * JPEG 解码调用栈，需要更多栈空间。
      *
      * 优先级 2 —— 低于温度任务（3），测温比拍照更重要。
-     * 参数传 NULL —— 摄像头任务不需要额外参数。
      */
     xTaskCreate(camera_task, "camera_task", 8192,
                 NULL, 2, NULL);
 
     ESP_LOGI(TAG, "System ready. Monitoring fish tank...");
+    ESP_LOGI(TAG, "MQTT Device ID: %s", mqtt_get_device_id());
 
     /* ═════════════════════════════════════════════════════════════
-     * 阶段 5：主循环（空闲）
+     * 阶段 6：主循环 — 定期上报设备状态
      *
      * app_main() 本身也是一个 FreeRTOS 任务（系统自动创建的"main task"）。
      * 它不能 return（return 后系统会重启）。
      *
-     * 所以这里放一个无限循环，定期做一些"主任务级别"的事情。
-     * 目前是空的（只延迟），后续可以加入：
-     *   - 监控 free heap（剩余内存）
-     *   - 监控任务栈使用情况
-     *   - 看门狗喂狗
-     *   - OTA 升级检查
+     * 这里定期上报设备健康状态到 MQTT：
+     *   - 运行时间
+     *   - 剩余堆内存
+     *   - MQTT 连接状态
+     *   - WiFi 信号强度（RSSI）
      *
-     * vTaskDelay(10000) = 让出 CPU 10 秒，什么都不做
+     * Topic: smart-fisher/{device_id}/status
+     * Payload: {"status":"online","uptime_s":3600,"free_heap":123456,"wifi_rssi":-45}
      * ═════════════════════════════════════════════════════════════ */
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(STATUS_PUBLISH_INTERVAL_MS));
+
+        if (mqtt_is_connected()) {
+            char status_topic[160];
+            char payload[256];
+            int64_t uptime_s = esp_timer_get_time() / 1000000;  /* us → s */
+            uint32_t free_heap = esp_get_free_heap_size();
+
+            /*
+             * 获取 WiFi RSSI（信号强度，单位 dBm）。
+             * 0 表示未连接或无法获取。
+             */
+            int rssi = 0;
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                rssi = ap_info.rssi;
+            }
+
+            snprintf(status_topic, sizeof(status_topic),
+                     "smart-fisher/%s/status",
+                     mqtt_get_device_id());
+            snprintf(payload, sizeof(payload),
+                     "{\"status\":\"online\","
+                     "\"uptime_s\":%lld,"
+                     "\"free_heap\":%lu,"
+                     "\"wifi_rssi\":%d,"
+                     "\"device_id\":\"%s\"}",
+                     (long long)uptime_s,
+                     (unsigned long)free_heap,
+                     rssi,
+                     mqtt_get_device_id());
+
+            mqtt_publish(status_topic, payload, 0, 1);  /* QoS 1 + retain */
+        }
     }
 }
