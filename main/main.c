@@ -87,10 +87,8 @@
  * ESP32-S3-CAM R16N8 引脚分配说明：
  *
  * 开发板的大部分 GPIO 已经被摄像头占用了。
- * GPIO4 是少数空闲的引脚之一，适合接 DS18B20。
+ * GPIO1 是少数空闲的引脚之一，适合接 DS18B20。
  *
- * 注意：GPIO4 同时也是板载 LED 闪光灯的控制引脚。
- * 后期开启摄像头时，可能需要改用其他空闲引脚（如 GPIO5/GPIO6）。
  */
 #define TEMP_SENSOR_GPIO  GPIO_NUM_1    /* DS18B20 数据线接 GPIO1（GPIO4 已被摄像头 SCCB SDA 占用） */
 

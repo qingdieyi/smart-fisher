@@ -93,10 +93,12 @@ smart-fisher/
 │   ├── CMakeLists.txt           # 源文件 + 编译依赖
 │   └── Kconfig.projbuild        # menuconfig 配置项
 ├── docs/
-│   ├── brd.md                 # 原始需求文档
-│   ├── development-plan.md    # 完整开发方案 + 调试实录
-│   ├── ESP32-S3CAM原理图.pdf   # 开发板原理图
-│   └── 参考程序/               # 官方参考程序 (BOARD_ESP32S3_WROOM)
+│   ├── brd.md                     # 原始需求文档
+│   ├── development-plan.md        # 完整开发方案 + 调试实录
+│   ├── esp-dl-yolo-plan.md        # ESP-DL + YOLO 鱼群检测方案
+│   ├── yolo-practical-guide.md    # 标注→训练→部署实操指南
+│   ├── ESP32-S3CAM原理图.pdf       # 开发板原理图
+│   └── 参考程序/                   # 官方参考程序 (BOARD_ESP32S3_WROOM)
 ├── sdkconfig.defaults         # 项目默认 Kconfig 配置
 └── CMakeLists.txt             # 顶层 CMake
 ```
