@@ -1,72 +1,71 @@
 /*
- * 鱼群检测模块 — 实现
- * ==========================================
+ * 鱼群检测模块 — 实现（双引擎：帧差法 + YOLO/ESP-DL）
+ * ================================================================
  *
  * ── 给你的话（Java 开发者看这里）───────────────────────────────────
  *
- * 本模块实现了基于帧差法的鱼群运动检测。
- * 不需要机器学习，不需要训练数据，只用简单的图像处理技术。
+ * 本模块支持两种检测引擎，通过 Kconfig 在编译时选择：
  *
- * ── 帧差法算法详解 ────────────────────────────────────────────────
+ *   方式 1: 帧差法 (SMART_FISHER_DETECTION_FRAME_DIFF)
+ *     - 纯 CPU 像素比较，不需要任何模型文件
+ *     - 快速 (~80ms)，低内存 (~40KB)
+ *     - 只能检测运动中的鱼
  *
- * 第 1 步：JPEG 解码
- *   ┌──────────────────────────────────────────────────────────────┐
- *   │ 使用 esp_jpeg 组件将 JPEG 解码为 RGB565 图像。              │
- *   │ 缩放比 1/8：800×600 → 100×75，速度和精度平衡。             │
- *   │                                                              │
- *   │ esp_jpeg 内部使用 Tjpgd（Tiny JPEG Decompressor），          │
- *   │ 是一个轻量级解码器，专为嵌入式设计。                          │
- *   └──────────────────────────────────────────────────────────────┘
+ *   方式 2: YOLO 目标检测 (SMART_FISHER_DETECTION_YOLO)
+ *     - 基于 ESP-DL 推理引擎运行 YOLOv11-nano 模型
+ *     - 可以检测静止的鱼，给出精确的 bounding box
+ *     - 需要预训练的 .espdl 模型文件
+ *     - 推理 ~120ms，PSRAM ~700KB
  *
- * 第 2 步：RGB565 → 灰度
- *   ┌──────────────────────────────────────────────────────────────┐
- *   │ 从 RGB565 像素提取 R、G、B 分量，计算亮度值：               │
- *   │                                                              │
- *   │   Y = 0.299 × R + 0.587 × G + 0.114 × B                    │
- *   │                                                              │
- *   │ 这是 BT.601 标准亮度公式（人眼对绿色最敏感）。               │
- *   │ 灰度值范围 0~255。                                           │
- *   │                                                              │
- *   │ RGB565 格式解释：                                            │
- *   │   Bit 15..11:  R (5-bit)                                    │
- *   │   Bit 10..5:   G (6-bit)                                    │
- *   │   Bit 4..0:    B (5-bit)                                    │
- *   └──────────────────────────────────────────────────────────────┘
+ * 两种方式共用同一套 API（fish_detector.h），上层 main.c 无感知。
  *
- * 第 3 步：帧差
- *   ┌──────────────────────────────────────────────────────────────┐
- *   │ 逐个像素比较当前帧和参考帧的灰度值：                         │
- *   │                                                              │
- *   │   diff(x,y) = |current(x,y) - reference(x,y)|               │
- *   │                                                              │
- *   │ 如果 diff(x,y) > MOTION_THRESHOLD → 该像素有运动。          │
- *   │                                                              │
- *   │ 阈值选择：太低 = 噪声，太高 = 漏检慢速鱼。                   │
- *   │ 25~30 是适合鱼缸场景的经验值。                               │
- *   └──────────────────────────────────────────────────────────────┘
+ * ── YOLO 推理管线 ─────────────────────────────────────────────────
  *
- * 第 4 步：连通域分析（Connected Component Labeling）
- *   ┌──────────────────────────────────────────────────────────────┐
- *   │ 使用 Two-Pass 算法为相邻的运动像素分配相同的 label：         │
- *   │                                                              │
- *   │ Pass 1：扫描图像，给每个运动像素一个临时 label。            │
- *   │         如果邻居也有 label，使用邻居的 label。               │
- *   │         如果左右邻居 label 不同，记录等价关系。              │
- *   │                                                              │
- *   │ Pass 2：用等价关系表统一 label。                            │
- *   │         统计每个 label 的像素数 → 过滤太小的区域。           │
- *   │         剩余 label 数 ≈ 鱼的条数。                          │
- *   └──────────────────────────────────────────────────────────────┘
+ *   JPEG (800×600)
+ *      │
+ *      ▼
+ *   esp_jpeg 解码 → RGB565 (200×150, 1/4 缩放)
+ *      │
+ *      ▼
+ *   双线性插值 → RGB888 (224×224)      ← 模型输入尺寸
+ *      │
+ *      ▼
+ *   ESP-DL 推理 (espdl_model_run)       ← 神经网络前向传播
+ *      │
+ *      ▼
+ *   NMS (非极大值抑制)                   ← 过滤重叠框
+ *      │
+ *      ▼
+ *   质心追踪 → 活跃度评估                ← 对比上一帧
+ *      │
+ *      ▼
+ *   fish_result_t
  *
- * 第 5 步：活跃度评估
- *   ┌──────────────────────────────────────────────────────────────┐
- *   │ motion_score = (运动像素数 / 总像素数) × 100                │
- *   │                                                              │
- *   │ 映射到活跃度标签：                                           │
- *   │   motion_score < 5%   → "calm"     (鱼在休息)               │
- *   │   motion_score 5~15%  → "moderate" (正常游动)               │
- *   │   motion_score > 15%  → "active"   (非常活跃，可能喂食时)   │
- *   └──────────────────────────────────────────────────────────────┘
+ * ── NMS 算法 ──────────────────────────────────────────────────────
+ *
+ *   目标检测模型会输出很多重叠的候选框。NMS 的作用是：
+ *     输入: 50 个候选框（很多重叠）
+ *     输出: 3 个最佳框（每条鱼一个）
+ *
+ *   算法:
+ *     1. 按置信度从高到低排序所有候选框
+ *     2. 取置信度最高的框 A → 加入"最终结果"
+ *     3. 计算 A 与其他所有框的 IoU（交并比）
+ *     4. 删除与 A 的 IoU > 阈值的框（它们是"同一个鱼"的重复检测）
+ *     5. 回到第 2 步，直到没有候选框
+ *
+ *   IoU = 交集面积 / 并集面积
+ *     IoU = 1.0 → 完全重叠（肯定是同一个目标）
+ *     IoU = 0.0 → 完全不重叠
+ *     阈值 0.45 → IoU > 45% 就视为重复
+ *
+ * ── 活跃度追踪 ────────────────────────────────────────────────────
+ *
+ *   对比当前帧和上一帧中每条鱼的 bounding box 质心位移：
+ *     - 质心几乎不动 → 鱼在休息 → 低活跃度
+ *     - 质心大幅移动 → 鱼在游动 → 高活跃度
+ *
+ *   使用最近邻匹配（Nearest Neighbor）关联两帧中的同一目标。
  */
 
 /* ── 头文件引入 ───────────────────────────────────────────────────── */
@@ -75,140 +74,149 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "jpeg_decoder.h"       /* esp_jpeg — JPEG 解码 API */
+
+#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO
+#include "esp_dl.h"             /* ESP-DL — 神经网络推理引擎 */
+#endif
 
 /* ── 模块日志标签 ─────────────────────────────────────────────────── */
 static const char *TAG = "fish-detector";
 
 /* ═══════════════════════════════════════════════════════════════════
- * 检测参数（可调）
- *
- * 这些值是根据 100×75 分辨率 + 鱼缸场景选的经验值。
- * 可以通过实验调整以获得更准确的检测结果。
+ * YOLO 配置常量（通过 Kconfig 可调）
  * ═══════════════════════════════════════════════════════════════════ */
 
-/*
- * JPEG 解码缩放比例。
- * 1/8 缩放：800×600 → 100×75 = 7500 像素。
- * 对于运动检测来说完全够用，而且速度快。
- */
-#define DETECT_SCALE        JPEG_IMAGE_SCALE_1_8
+#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO
 
-/*
- * 运动检测阈值（0~255）。
- * 两个像素灰度值相差超过此值才认为是"运动"。
- *
- * 太低：环境光线波动会被误判为鱼
- * 太高：缓慢游动的鱼可能漏检
- * 25~30 是适合室内鱼缸的经验范围
- */
-#define MOTION_THRESHOLD    28
+/* 模型输入尺寸（espdet_pico 标准：224×224） */
+#define YOLO_INPUT_W        224
+#define YOLO_INPUT_H        224
+#define YOLO_INPUT_C        3       /* RGB */
 
-/*
- * 最小鱼区域（像素数）。
- * 连通域小于此值的会被当作噪声过滤掉。
- *
- * 100×75 图像中：
- *   - 3 像素 ≈ 实际图像中 24×24 像素区域（放大 8 倍后）
- *   - 对应约 3~5cm 的鱼在 800×600 图像中的大小
- *   - 太小可能是气泡、饲料残渣等
- *   - 太大可能几条鱼重叠
- */
-#define MIN_FISH_AREA       3
+/* 置信度阈值 — 低于此值的检测结果丢弃 */
+#ifndef CONFIG_SMART_FISHER_YOLO_CONFIDENCE_THRESHOLD
+#define YOLO_CONF_THRESHOLD 0.50f
+#else
+#define YOLO_CONF_THRESHOLD CONFIG_SMART_FISHER_YOLO_CONFIDENCE_THRESHOLD
+#endif
 
-/*
- * 最多检测的鱼数量。
- * 限制 label 数组大小，节省内存。
- */
-#define MAX_FISH_COUNT      20
+/* NMS 的 IoU 阈值 — 高于此值的重叠框视为重复 */
+#ifndef CONFIG_SMART_FISHER_YOLO_IOU_THRESHOLD
+#define YOLO_IOU_THRESHOLD  0.45f
+#else
+#define YOLO_IOU_THRESHOLD  CONFIG_SMART_FISHER_YOLO_IOU_THRESHOLD
+#endif
 
-/*
- * JPEG 解码工作缓冲区大小（字节）。
- * Tjpgd 需要一块 scratchpad 内存。
- * 3.1KB 是默认值（JD_FASTDECODE == 0），足够 100×75 解码。
- */
+/* 最大检测目标数 */
+#define YOLO_MAX_DETECTIONS 20
+
+/* JPEG 解码缩放比（用于检测预处理） */
+#define YOLO_JPEG_SCALE     JPEG_IMAGE_SCALE_1_4   /* 800×600/4 = 200×150 */
+
+/* JPEG 解码工作缓冲区 */
 #define JPEG_WORK_BUF_SIZE  3200
 
+#endif /* CONFIG_SMART_FISHER_DETECTION_YOLO */
+
 /* ═══════════════════════════════════════════════════════════════════
- * 全局状态
+ * 帧差法配置常量
  * ═══════════════════════════════════════════════════════════════════ */
 
+#ifndef CONFIG_SMART_FISHER_DETECTION_YOLO
+
+#define DETECT_SCALE        JPEG_IMAGE_SCALE_1_8   /* 800/8=100, 600/8=75 */
+#define MOTION_THRESHOLD    28
+#define MIN_FISH_AREA       3
+#define MAX_FISH_COUNT      20
+#define JPEG_WORK_BUF_SIZE  3200
+
+#endif /* !CONFIG_SMART_FISHER_DETECTION_YOLO */
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 全局状态（两个引擎共用）
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static uint8_t jpeg_work_buf[JPEG_WORK_BUF_SIZE];  /* JPEG 解码 scratchpad */
+
+#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO
+
 /*
- * 检测器状态标记。
- * has_reference = false 表示还没拍过第一张照片，下次拍照会存为参考帧。
+ * ── YOLO 引擎状态 ──────────────────────────────────────────────────
  */
+
+/* 模型句柄 */
+static void *yolo_model = NULL;
+
+/* 模型输入 buffer: 224×224×3 = 150,528 bytes（PSRAM） */
+static uint8_t *yolo_input = NULL;
+
+/* 上一帧检测到的 bbox（用于活跃度追踪） */
+typedef struct {
+    float cx, cy;           /* bbox 质心坐标（归一化 0~1） */
+    float w, h;             /* 宽高 */
+} tracked_bbox_t;
+
+static tracked_bbox_t prev_bboxes[YOLO_MAX_DETECTIONS];
+static int prev_bbox_count = 0;
+
+/*
+ * 模型二进制数据（通过 CMake target_add_binary_data 嵌入固件）。
+ *
+ * 符号名由 CMake 自动生成：
+ *   models/espdet_pico_fish.espdl
+ *   → _binary_models_espdet_pico_fish_espdl_start
+ *   → _binary_models_espdet_pico_fish_espdl_end
+ *
+ * 如果编译报 "undefined symbol"，检查：
+ *   1. CMakeLists.txt 中有 target_add_binary_data 行
+ *   2. 模型文件确实在 main/models/ 目录下
+ *   3. 文件名中的 / 和 . 在符号名中被转为了 _
+ */
+extern const uint8_t
+    _binary_models_espdet_pico_fish_espdl_start[] asm(
+        "_binary_models_espdet_pico_fish_espdl_start");
+extern const uint8_t
+    _binary_models_espdet_pico_fish_espdl_end[] asm(
+        "_binary_models_espdet_pico_fish_espdl_end");
+
+#else /* CONFIG_SMART_FISHER_DETECTION_FRAME_DIFF */
+
+/*
+ * ── 帧差法引擎状态 ────────────────────────────────────────────────
+ */
+
 static bool has_reference = false;
-
-/*
- * 当前帧灰度图 buffer（堆分配）。
- * 大小 = width × height = 100 × 75（取决于 JPEG 实际尺寸和缩放比）
- */
 static uint8_t *current_gray = NULL;
-static uint8_t *reference_gray = NULL;  /* 参考帧灰度图 */
-static int img_width = 0;
-static int img_height = 0;
-static int img_pixels = 0;              /* width × height */
-
-/*
- * 运动标记图和 label 图。
- * 在连通域分析阶段分配和释放。
- * - motion_map: 差分结果，1=运动，0=静止
- * - label_map: 连通域标记结果，0=背景，1~N=各连通域 ID
- */
+static uint8_t *reference_gray = NULL;
 static uint8_t *motion_map = NULL;
 static uint16_t *label_map = NULL;
+static int img_width = 0;
+static int img_height = 0;
+static int img_pixels = 0;
 
-/*
- * JPEG 解码工作缓冲区（静态分配，避免碎片）。
- */
-static uint8_t jpeg_work_buf[JPEG_WORK_BUF_SIZE];
+#endif /* CONFIG_SMART_FISHER_DETECTION_FRAME_DIFF */
 
 /* ═══════════════════════════════════════════════════════════════════
- * 内部辅助函数
+ * 内部辅助 — RGB565 → 灰度（帧差法用）
  * ═══════════════════════════════════════════════════════════════════ */
 
-/**
- * 从 RGB565 像素提取亮度（灰度）值。
- *
- * RGB565 位布局：
- *   Bit:  15 14 13 12 11  10  9  8  7  6  5   4  3  2  1  0
- *         └──── R ─────┘ └────── G ──────┘ └────── B ──────┘
- *              5-bit            6-bit             5-bit
- *
- * 亮度公式（BT.601）：
- *   Y = 0.299 × R + 0.587 × G + 0.114 × B
- *
- * 用整数运算避免浮点（ESP32-S3 有 FPU 但整数更快）：
- *   R8 = R5 << 3 | R5 >> 2      (5-bit → 8-bit 扩展)
- *   G8 = G6 << 2 | G6 >> 4      (6-bit → 8-bit 扩展)
- *   B8 = B5 << 3 | B5 >> 2      (5-bit → 8-bit 扩展)
- *   Y  = (77 × R8 + 150 × G8 + 29 × B8) >> 8
- *   （77/256 ≈ 0.301, 150/256 ≈ 0.586, 29/256 ≈ 0.113）
- */
+#ifndef CONFIG_SMART_FISHER_DETECTION_YOLO
+
 static inline uint8_t rgb565_to_gray(uint16_t pixel)
 {
-    /* 提取各通道并扩展到 8-bit */
-    uint8_t r = ((pixel >> 11) & 0x1F);   /* 5-bit R */
-    uint8_t g = ((pixel >> 5)  & 0x3F);   /* 6-bit G */
-    uint8_t b = (pixel         & 0x1F);   /* 5-bit B */
-
-    r = (r << 3) | (r >> 2);   /* 扩展到 8-bit */
+    uint8_t r = ((pixel >> 11) & 0x1F);
+    uint8_t g = ((pixel >> 5)  & 0x3F);
+    uint8_t b = (pixel         & 0x1F);
+    r = (r << 3) | (r >> 2);
     g = (g << 2) | (g >> 4);
     b = (b << 3) | (b >> 2);
-
-    /* BT.601 亮度（整数近似）: Y = 0.299R + 0.587G + 0.114B */
     return (uint8_t)(((uint32_t)r * 77 + (uint32_t)g * 150 + (uint32_t)b * 29) >> 8);
 }
 
-/**
- * 将 RGB565 图像转换为灰度图。
- *
- * @param rgb565   输入的 RGB565 像素数组
- * @param gray     输出的灰度像素数组
- * @param count    像素总数
- */
 static void convert_to_grayscale(const uint16_t *rgb565, uint8_t *gray, int count)
 {
     for (int i = 0; i < count; i++) {
@@ -216,24 +224,13 @@ static void convert_to_grayscale(const uint16_t *rgb565, uint8_t *gray, int coun
     }
 }
 
-/**
- * 帧差计算：比较当前帧和参考帧的每个像素。
- *
- * @param current   当前帧灰度图
- * @param reference 参考帧灰度图
- * @param motion    输出的运动标记图（1=运动，0=静止）
- * @param count     像素总数
- * @return          运动像素数量
- */
 static int compute_frame_diff(const uint8_t *current, const uint8_t *reference,
                               uint8_t *motion, int count)
 {
     int motion_pixels = 0;
-
     for (int i = 0; i < count; i++) {
         int diff = (int)current[i] - (int)reference[i];
-        if (diff < 0) diff = -diff;   /* 绝对值 */
-
+        if (diff < 0) diff = -diff;
         if (diff > MOTION_THRESHOLD) {
             motion[i] = 1;
             motion_pixels++;
@@ -241,225 +238,415 @@ static int compute_frame_diff(const uint8_t *current, const uint8_t *reference,
             motion[i] = 0;
         }
     }
-
     return motion_pixels;
 }
 
-/**
- * 连通域分析 — Two-Pass 算法。
- *
- * Pass 1：扫描每个像素
- *   - 如果 motion_map[p] == 0 → 跳过
- *   - 如果 motion_map[p] == 1 → 检查左、上、左上、右上邻居的 label
- *     - 如果所有邻居都没有 label → 分配新 label
- *     - 如果邻居有 label → 使用邻居的 label
- *     - 如果有多个不同 label → 记录等价关系（它们属于同一个区域）
- *
- * Pass 2：统一 label
- *   - 用并查集（Union-Find）合并等价 label
- *   - 重新扫描，把 label 替换为根 label
- *
- * 最后阶段：统计每个最终 label 的像素数
- *   - 像素数 < MIN_FISH_AREA → 噪声，忽略
- *   - 像素数 >= MIN_FISH_AREA → 算作一条鱼
- *
- * @param motion     运动标记图
- * @param label      输出的 label 图
- * @param width      图像宽度
- * @param height     图像高度
- * @param max_labels 最大 label 数量（label 数组大小）
- * @return           检测到的鱼数量（过滤后剩余的区域数）
+/*
+ * ── 连通域分析（Two-Pass + Union-Find）───────────────────────────
  */
 static int find_connected_components(const uint8_t *motion, uint16_t *label,
                                      int width, int height, int max_labels)
 {
-    /*
-     * ── 并查集（Union-Find）数据结构 ──
-     *
-     * parent[i] = i 的父节点
-     * 初始 parent[i] = i（每个元素是独立的集合）
-     *
-     * 等价于 Java 的：
-     *   Map<Integer, Integer> parent = new HashMap<>();
-     */
-    int parent[MAX_FISH_COUNT + 2];     /* +2 留余量，索引 0 不用 */
-    int area[MAX_FISH_COUNT + 2];       /* 每个 label 的像素面积 */
-    int next_label = 1;                  /* 下一个可用的 label（索引 0 表示背景）*/
+    int parent[MAX_FISH_COUNT + 2];
+    int area[MAX_FISH_COUNT + 2];
+    int next_label = 1;
     int max_label = max_labels + 1;
 
-    /* 初始化 */
     memset(label, 0, width * height * sizeof(uint16_t));
     memset(area, 0, sizeof(area));
-    for (int i = 0; i <= max_labels + 1; i++) {
-        parent[i] = i;
-    }
+    for (int i = 0; i <= max_labels + 1; i++) parent[i] = i;
 
-    /*
-     * ── Pass 1：分配临时 label ──
-     */
+    /* Pass 1: assign temporary labels */
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int idx = y * width + x;
+            if (motion[idx] == 0) continue;
 
-            if (motion[idx] == 0) {
-                continue;   /* 非运动像素，跳过 */
-            }
+            int left_label  = (x > 0)          ? label[y * width + (x-1)]     : 0;
+            int top_label   = (y > 0)          ? label[(y-1) * width + x]     : 0;
+            int topleft_lbl = (x > 0 && y > 0) ? label[(y-1) * width+(x-1)]  : 0;
+            int topright_lbl= (x<width-1&&y>0) ? label[(y-1) * width+(x+1)]  : 0;
 
-            /*
-             * 检查四个方向的邻居（8-连通）：
-             *   左上 (x-1, y-1)    上 (x, y-1)    右上 (x+1, y-1)
-             *    左 (x-1, y)
-             *
-             * 只检查已经扫描过的邻居（上方和左侧），
-             * 因为扫描顺序是从左到右、从上到下。
-             */
-            int left_label  = (x > 0)           ? label[y * width + (x-1)]     : 0;
-            int top_label   = (y > 0)           ? label[(y-1) * width + x]     : 0;
-            int topleft_label  = (x > 0 && y > 0)      ? label[(y-1) * width + (x-1)] : 0;
-            int topright_label = (x < width-1 && y > 0) ? label[(y-1) * width + (x+1)] : 0;
+            int neighbors[4]; int nc = 0;
+            if (left_label > 0)   neighbors[nc++] = left_label;
+            if (top_label > 0)    neighbors[nc++] = top_label;
+            if (topleft_lbl > 0)  neighbors[nc++] = topleft_lbl;
+            if (topright_lbl > 0) neighbors[nc++] = topright_lbl;
 
-            /*
-             * 收集所有邻居的 label（去 0）。
-             */
-            int neighbor_labels[4];
-            int nl_count = 0;
-            if (left_label > 0) neighbor_labels[nl_count++] = left_label;
-            if (top_label > 0)  neighbor_labels[nl_count++] = top_label;
-            if (topleft_label > 0)  neighbor_labels[nl_count++] = topleft_label;
-            if (topright_label > 0) neighbor_labels[nl_count++] = topright_label;
-
-            if (nl_count == 0) {
-                /*
-                 * 没有邻居 → 分配新 label。
-                 */
-                if (next_label > max_label) {
-                    continue;   /* label 不够用了，丢弃后续像素 */
-                }
+            if (nc == 0) {
+                if (next_label > max_label) continue;
                 label[idx] = next_label;
                 area[next_label] = 1;
                 next_label++;
             } else {
-                /*
-                 * 有邻居 → 使用最小的邻居 label。
-                 * 如果有多种 label，记录等价关系。
-                 */
-                int min_label = neighbor_labels[0];
-                for (int i = 1; i < nl_count; i++) {
-                    if (neighbor_labels[i] < min_label) {
-                        min_label = neighbor_labels[i];
-                    }
-                }
-                label[idx] = min_label;
-                area[min_label]++;
-
-                /*
-                 * 合并等价 label（Union）。
-                 * 找每个邻居 label 的根，统一到 min_label 的根下。
-                 */
-                for (int i = 0; i < nl_count; i++) {
-                    int lbl = neighbor_labels[i];
-                    /* 找 lbl 的根 */
-                    while (parent[lbl] != lbl) {
-                        lbl = parent[lbl];
-                    }
-                    /* 找 min_label 的根 */
-                    int root = min_label;
-                    while (parent[root] != root) {
-                        root = parent[root];
-                    }
-                    /* 合并 */
-                    if (lbl != root) {
-                        parent[lbl] = root;
-                    }
+                int min_lbl = neighbors[0];
+                for (int i = 1; i < nc; i++)
+                    if (neighbors[i] < min_lbl) min_lbl = neighbors[i];
+                label[idx] = min_lbl;
+                area[min_lbl]++;
+                for (int i = 0; i < nc; i++) {
+                    int lbl = neighbors[i];
+                    while (parent[lbl] != lbl) lbl = parent[lbl];
+                    int root = min_lbl;
+                    while (parent[root] != root) root = parent[root];
+                    if (lbl != root) parent[lbl] = root;
                 }
             }
         }
     }
 
-    /*
-     * ── Pass 2：统一 label（路径压缩）──
-     */
+    /* Pass 2: resolve equivalences */
     for (int i = 0; i < width * height; i++) {
         if (label[i] > 0) {
             int lbl = label[i];
-            while (parent[lbl] != lbl) {
-                lbl = parent[lbl];
-            }
+            while (parent[lbl] != lbl) lbl = parent[lbl];
             label[i] = lbl;
         }
     }
 
-    /*
-     * ── 统计最终区域 ──
-     *
-     * 重新统计每个根 label 的像素面积（Pass 1 中的统计被合并打乱了）。
-     * 只保留面积 >= MIN_FISH_AREA 的区域。
-     */
+    /* Count valid regions */
     memset(area, 0, sizeof(area));
+    for (int i = 0; i < width * height; i++)
+        if (label[i] > 0 && label[i] <= max_label) area[label[i]]++;
 
-    /* 重新计算每个 label 的面积 */
-    for (int i = 0; i < width * height; i++) {
-        if (label[i] > 0 && label[i] <= max_label) {
-            area[label[i]]++;
-        }
-    }
-
-    /*
-     * 统计有效区域数（过滤噪声）。
-     * 每个面积 >= MIN_FISH_AREA 的区域算作一条鱼。
-     */
     int fish_count = 0;
-    int valid_labels[MAX_FISH_COUNT + 2] = {0};
-
+    int valid[MAX_FISH_COUNT + 2] = {0};
     for (int lbl = 1; lbl < next_label; lbl++) {
-        /* 只统计根节点（parent[lbl] == lbl）的区域 */
         if (parent[lbl] == lbl && area[lbl] >= MIN_FISH_AREA) {
-            valid_labels[lbl] = 1;
+            valid[lbl] = 1;
             fish_count++;
         }
     }
-
-    /*
-     * 可选：把非鱼的区域标记回 0（背景）。
-     * 这对于调试很有用。生产环境可以跳过以节省时间。
-     */
-    for (int i = 0; i < width * height; i++) {
-        if (label[i] > 0 && label[i] <= max_label) {
-            if (!valid_labels[label[i]]) {
-                label[i] = 0;   /* 过滤掉噪声 */
-            }
-        }
-    }
+    for (int i = 0; i < width * height; i++)
+        if (label[i] > 0 && label[i] <= max_label && !valid[label[i]])
+            label[i] = 0;
 
     return fish_count;
 }
 
+#endif /* !CONFIG_SMART_FISHER_DETECTION_YOLO */
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 内部辅助 — YOLO NMS + 追踪
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO
+
 /**
- * 获取活跃度标签。
+ * 从 RGB565 像素提取单通道并归一化到 [0,1]。
  *
- * @param motion_score  运动分数（0~100）
- * @return              活跃度字符串
+ * ESP-DL 模型通常期望 float32 输入，范围 [0,1] 或 [0,255]。
+ * espdet_pico 使用 INT8 量化，输入为 uint8 [0,255]。
  */
-static const char *get_activity_label(int motion_score)
+static inline void rgb565_to_rgb888(uint16_t pixel,
+                                    uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    if (motion_score < 5) {
-        return "calm";
-    } else if (motion_score < 15) {
-        return "moderate";
-    } else {
-        return "active";
+    *r = ((pixel >> 11) & 0x1F);
+    *g = ((pixel >> 5)  & 0x3F);
+    *b = (pixel         & 0x1F);
+    *r = (*r << 3) | (*r >> 2);
+    *g = (*g << 2) | (*g >> 4);
+    *b = (*b << 3) | (*b >> 2);
+}
+
+/**
+ * 双线性插值缩放：RGB565 源 → RGB888 目标。
+ *
+ * 把解码后的 JPEG 缩放到模型需要的 224×224。
+ * 双线性插值比最近邻更平滑，有助于模型检测小目标。
+ *
+ * @param src       RGB565 源数据
+ * @param src_w     源宽度
+ * @param src_h     源高度
+ * @param dst       RGB888 目标数据（dst_w × dst_h × 3）
+ * @param dst_w     目标宽度
+ * @param dst_h     目标高度
+ */
+static void resize_rgb565_to_rgb888_bilinear(
+    const uint16_t *src, int src_w, int src_h,
+    uint8_t *dst, int dst_w, int dst_h)
+{
+    float scale_x = (float)src_w / dst_w;
+    float scale_y = (float)src_h / dst_h;
+
+    for (int dy = 0; dy < dst_h; dy++) {
+        float sy = dy * scale_y;
+        int sy0 = (int)sy;
+        int sy1 = (sy0 + 1 < src_h) ? sy0 + 1 : sy0;
+        float fy = sy - sy0;
+
+        for (int dx = 0; dx < dst_w; dx++) {
+            float sx = dx * scale_x;
+            int sx0 = (int)sx;
+            int sx1 = (sx0 + 1 < src_w) ? sx0 + 1 : sx0;
+            float fx = sx - sx0;
+
+            /* 四个角点 (top-left, top-right, bottom-left, bottom-right) */
+            uint8_t r00, g00, b00, r01, g01, b01;
+            uint8_t r10, g10, b10, r11, g11, b11;
+
+            rgb565_to_rgb888(src[sy0 * src_w + sx0], &r00, &g00, &b00);
+            rgb565_to_rgb888(src[sy0 * src_w + sx1], &r01, &g01, &b01);
+            rgb565_to_rgb888(src[sy1 * src_w + sx0], &r10, &g10, &b10);
+            rgb565_to_rgb888(src[sy1 * src_w + sx1], &r11, &g11, &b11);
+
+            /* 双线性插值 */
+            float w00 = (1.0f - fx) * (1.0f - fy);
+            float w01 = fx * (1.0f - fy);
+            float w10 = (1.0f - fx) * fy;
+            float w11 = fx * fy;
+
+            int didx = (dy * dst_w + dx) * 3;
+            dst[didx + 0] = (uint8_t)(r00 * w00 + r01 * w01 + r10 * w10 + r11 * w11);
+            dst[didx + 1] = (uint8_t)(g00 * w00 + g01 * w01 + g10 * w10 + g11 * w11);
+            dst[didx + 2] = (uint8_t)(b00 * w00 + b01 * w01 + b10 * w10 + b11 * w11);
+        }
     }
 }
 
+/**
+ * NMS (Non-Maximum Suppression) — 非极大值抑制。
+ *
+ * 输入: 原始检测框数组
+ * 输出: 去重后的检测框数组（修改 in-place）
+ *
+ * 算法步骤：
+ *   1. 按置信度降序排序
+ *   2. 遍历：每个框与后续所有框算 IoU
+ *   3. IoU > 阈值 → 标记为抑制
+ *   4. 压缩数组（保留未抑制的框）
+ *
+ * @param boxes       检测框数组 [x1,y1,x2,y2,conf]（in-place）
+ * @param count       输入框数量，输出后为去重后的数量
+ * @param max_count   数组最大容量
+ * @param iou_thresh  IoU 阈值
+ */
+static void nms_suppress(float *boxes, int *count, int max_count, float iou_thresh)
+{
+    int n = *count;
+    if (n <= 1) return;
+
+    /* 1. 按置信度降序排序（简单冒泡，n 很小） */
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (boxes[j * 5 + 4] > boxes[i * 5 + 4]) {
+                /* Swap 5 floats */
+                for (int k = 0; k < 5; k++) {
+                    float tmp = boxes[i * 5 + k];
+                    boxes[i * 5 + k] = boxes[j * 5 + k];
+                    boxes[j * 5 + k] = tmp;
+                }
+            }
+        }
+    }
+
+    /* 2. NMS 抑制 */
+    uint8_t suppressed[YOLO_MAX_DETECTIONS];
+    memset(suppressed, 0, sizeof(suppressed));
+
+    for (int i = 0; i < n; i++) {
+        if (suppressed[i]) continue;
+
+        float ax1 = boxes[i * 5 + 0];
+        float ay1 = boxes[i * 5 + 1];
+        float ax2 = boxes[i * 5 + 2];
+        float ay2 = boxes[i * 5 + 3];
+        float a_area = (ax2 - ax1) * (ay2 - ay1);
+        if (a_area <= 0) continue;
+
+        for (int j = i + 1; j < n; j++) {
+            if (suppressed[j]) continue;
+
+            float bx1 = boxes[j * 5 + 0];
+            float by1 = boxes[j * 5 + 1];
+            float bx2 = boxes[j * 5 + 2];
+            float by2 = boxes[j * 5 + 3];
+            float b_area = (bx2 - bx1) * (by2 - by1);
+            if (b_area <= 0) continue;
+
+            /* IoU = intersection / union */
+            float ix1 = (ax1 > bx1) ? ax1 : bx1;
+            float iy1 = (ay1 > by1) ? ay1 : by1;
+            float ix2 = (ax2 < bx2) ? ax2 : bx2;
+            float iy2 = (ay2 < by2) ? ay2 : by2;
+            float iw = ix2 - ix1;
+            float ih = iy2 - iy1;
+
+            if (iw > 0 && ih > 0) {
+                float intersection = iw * ih;
+                float union_area = a_area + b_area - intersection;
+                float iou = intersection / union_area;
+
+                if (iou > iou_thresh) {
+                    suppressed[j] = 1;
+                }
+            }
+        }
+    }
+
+    /* 3. 压缩数组（移除被抑制的框） */
+    int new_count = 0;
+    for (int i = 0; i < n; i++) {
+        if (!suppressed[i]) {
+            if (new_count != i) {
+                memcpy(&boxes[new_count * 5], &boxes[i * 5], 5 * sizeof(float));
+            }
+            new_count++;
+        }
+    }
+    *count = new_count;
+}
+
+/**
+ * 基于 bbox 质心位移计算活跃度。
+ *
+ * 对当前帧的每个 bbox，找上一帧最近的 bbox，
+ * 计算质心欧氏距离，累加后归一化为 0~100 的分数。
+ *
+ * @param cur_boxes  当前帧 bbox [cx,cy,w,h]
+ * @param cur_count  当前帧数量
+ * @param prev_boxes 上一帧 bbox
+ * @param prev_count 上一帧数量
+ * @return           活跃度分数 0~100
+ */
+static int compute_motion_score_bbox(
+    const tracked_bbox_t *cur_boxes, int cur_count,
+    const tracked_bbox_t *prev_boxes, int prev_count)
+{
+    if (cur_count == 0 || prev_count == 0) return 0;
+
+    float total_displacement = 0.0f;
+
+    for (int i = 0; i < cur_count; i++) {
+        float min_dist = 1000.0f;  /* 大初始值 */
+
+        for (int j = 0; j < prev_count; j++) {
+            float dx = cur_boxes[i].cx - prev_boxes[j].cx;
+            float dy = cur_boxes[i].cy - prev_boxes[j].cy;
+            float dist = sqrtf(dx * dx + dy * dy);
+            if (dist < min_dist) min_dist = dist;
+        }
+
+        total_displacement += min_dist;
+    }
+
+    /* 归一化：假设每条鱼最大位移约 15% 画面宽度 */
+    float avg_displacement = total_displacement / cur_count;
+    int score = (int)(avg_displacement * 100.0f / 0.15f);
+    return (score > 100) ? 100 : score;
+}
+
+/**
+ * 活跃度标签映射。
+ */
+static const char *get_activity_label_yolo(int motion_score)
+{
+    if (motion_score < 5)  return "calm";
+    if (motion_score < 15) return "moderate";
+    return "active";
+}
+
+#endif /* CONFIG_SMART_FISHER_DETECTION_YOLO */
+
 /* ═══════════════════════════════════════════════════════════════════
- * 公开 API 实现
+ * 帧差法活跃度标签
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#ifndef CONFIG_SMART_FISHER_DETECTION_YOLO
+
+static const char *get_activity_label(int motion_score)
+{
+    if (motion_score < 5)  return "calm";
+    if (motion_score < 15) return "moderate";
+    return "active";
+}
+
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 公开 API — fish_detector_init()
  * ═══════════════════════════════════════════════════════════════════ */
 
 esp_err_t fish_detector_init(void)
 {
-    ESP_LOGI(TAG, "Initializing fish detector (frame-differencing method)");
-    ESP_LOGI(TAG, "Parameters: threshold=%d, min_area=%d, max_fish=%d",
+#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO
+
+    ESP_LOGI(TAG, "═══════════════════════════════════════");
+    ESP_LOGI(TAG, "  Fish Detector: YOLO (ESP-DL)");
+    ESP_LOGI(TAG, "  Input: %d×%d RGB888", YOLO_INPUT_W, YOLO_INPUT_H);
+    ESP_LOGI(TAG, "  Conf threshold: %.2f", (double)YOLO_CONF_THRESHOLD);
+    ESP_LOGI(TAG, "  IoU threshold: %.2f", (double)YOLO_IOU_THRESHOLD);
+    ESP_LOGI(TAG, "═══════════════════════════════════════");
+
+    /* ── 步骤 1: 获取模型大小 ── */
+    size_t model_size = (size_t)(
+        _binary_models_espdet_pico_fish_espdl_end -
+        _binary_models_espdet_pico_fish_espdl_start);
+
+    if (model_size == 0 || model_size > 10 * 1024 * 1024) {
+        ESP_LOGE(TAG, "Model size invalid (%u bytes). "
+                 "Make sure main/models/espdet_pico_fish.espdl exists.",
+                 (unsigned int)model_size);
+        ESP_LOGE(TAG, "Run the training pipeline first: "
+                 "see docs/yolo-practical-guide.md");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Model size: %u bytes (%.1f KB)",
+             (unsigned int)model_size, (double)model_size / 1024.0);
+
+    /* ── 步骤 2: 加载模型 ──
+     *
+     * espdl_model_load() 解析 .espdl 文件，初始化推理引擎。
+     * 模型权重保留在 Flash 中（const data），
+     * 运行时按需将部分权重加载到 PSRAM 加速。
+     */
+    esp_dl_model_config_t model_cfg = {
+        .model_data = (void *)_binary_models_espdet_pico_fish_espdl_start,
+        .model_size = model_size,
+        .prefer_mem = ESP_DL_MEM_PSRAM,    /* 优先使用 PSRAM */
+    };
+
+    yolo_model = esp_dl_model_load(&model_cfg);
+    if (yolo_model == NULL) {
+        ESP_LOGE(TAG, "Failed to load YOLO model. "
+                 "Check that the .espdl file is valid.");
+        ESP_LOGE(TAG, "Model may be corrupted or incompatible "
+                 "with this ESP-DL version.");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "YOLO model loaded successfully");
+
+    /* ── 步骤 3: 分配模型输入 buffer ── */
+    yolo_input = (uint8_t *)heap_caps_malloc(
+        YOLO_INPUT_W * YOLO_INPUT_H * YOLO_INPUT_C,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (yolo_input == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate model input buffer (%d bytes)",
+                 YOLO_INPUT_W * YOLO_INPUT_H * YOLO_INPUT_C);
+        esp_dl_model_free(yolo_model);
+        yolo_model = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* ── 步骤 4: 清空追踪状态 ── */
+    memset(prev_bboxes, 0, sizeof(prev_bboxes));
+    prev_bbox_count = 0;
+
+    ESP_LOGI(TAG, "YOLO detector ready. Input buffer: %d bytes (%d×%d×%d)",
+             YOLO_INPUT_W * YOLO_INPUT_H * YOLO_INPUT_C,
+             YOLO_INPUT_W, YOLO_INPUT_H, YOLO_INPUT_C);
+
+    return ESP_OK;
+
+#else /* CONFIG_SMART_FISHER_DETECTION_FRAME_DIFF */
+
+    ESP_LOGI(TAG, "═══════════════════════════════════════");
+    ESP_LOGI(TAG, "  Fish Detector: Frame Differencing");
+    ESP_LOGI(TAG, "  Threshold: %d, Min area: %d, Max fish: %d",
              MOTION_THRESHOLD, MIN_FISH_AREA, MAX_FISH_COUNT);
+    ESP_LOGI(TAG, "═══════════════════════════════════════");
 
     has_reference = false;
     img_width = 0;
@@ -467,7 +654,239 @@ esp_err_t fish_detector_init(void)
     img_pixels = 0;
 
     return ESP_OK;
+
+#endif
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 公开 API — fish_detector_analyze()  [YOLO 版本]
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO
+
+esp_err_t fish_detector_analyze(const uint8_t *jpeg_data, size_t jpeg_len,
+                                fish_result_t *result)
+{
+    if (jpeg_data == NULL || jpeg_len == 0 || result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int64_t t_total_start = esp_timer_get_time();
+
+    memset(result, 0, sizeof(fish_result_t));
+    result->activity = "unknown";
+
+    if (yolo_model == NULL) {
+        ESP_LOGW(TAG, "YOLO model not loaded, skipping detection");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* ───────────────────────────────────────────────────────────
+     * 第 1 步: JPEG 解码 → RGB565 (1/4 缩放, 200×150)
+     * ─────────────────────────────────────────────────────────── */
+
+    esp_jpeg_image_cfg_t jpeg_cfg = {
+        .indata = (uint8_t *)jpeg_data,
+        .indata_size = (uint32_t)jpeg_len,
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale = YOLO_JPEG_SCALE,
+        .flags = { .swap_color_bytes = 0 },
+        .advanced = {
+            .working_buffer = jpeg_work_buf,
+            .working_buffer_size = sizeof(jpeg_work_buf),
+        },
+    };
+
+    esp_jpeg_image_output_t jpeg_out;
+    esp_err_t ret = esp_jpeg_get_image_info(&jpeg_cfg, &jpeg_out);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "JPEG info failed: 0x%X", (unsigned int)ret);
+        return ESP_FAIL;
+    }
+
+    int jpeg_w = jpeg_out.width;
+    int jpeg_h = jpeg_out.height;
+    size_t rgb565_size = jpeg_w * jpeg_h * 2;
+
+    uint16_t *rgb565_buf = (uint16_t *)heap_caps_malloc(
+        rgb565_size, MALLOC_CAP_SPIRAM);
+    if (rgb565_buf == NULL) {
+        ESP_LOGE(TAG, "RGB565 buffer alloc failed (%u bytes)",
+                 (unsigned int)rgb565_size);
+        return ESP_ERR_NO_MEM;
+    }
+
+    jpeg_cfg.outbuf = (uint8_t *)rgb565_buf;
+    jpeg_cfg.outbuf_size = (uint32_t)rgb565_size;
+
+    ret = esp_jpeg_decode(&jpeg_cfg, &jpeg_out);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "JPEG decode failed: 0x%X", (unsigned int)ret);
+        free(rgb565_buf);
+        return ESP_FAIL;
+    }
+
+    int64_t t_after_jpeg = esp_timer_get_time();
+
+    /* ───────────────────────────────────────────────────────────
+     * 第 2 步: 缩放到 224×224 RGB888（双线性插值）
+     * ─────────────────────────────────────────────────────────── */
+
+    resize_rgb565_to_rgb888_bilinear(
+        rgb565_buf, jpeg_w, jpeg_h,
+        yolo_input, YOLO_INPUT_W, YOLO_INPUT_H);
+
+    free(rgb565_buf);
+    rgb565_buf = NULL;
+
+    int64_t t_after_resize = esp_timer_get_time();
+
+    /* ───────────────────────────────────────────────────────────
+     * 第 3 步: ESP-DL 推理
+     *
+     * 输入: yolo_input (224×224×3 uint8 RGB888, NHWC 格式)
+     * 输出: 检测框 float 数组 [N][6] = {x1,y1,x2,y2,conf,class}
+     *       或原始 YOLO 输出（需要额外解码）
+     *
+     * 注意: 具体的输出格式取决于模型导出时的配置。
+     *       espdet_pico 默认输出已解码的检测框。
+     * ─────────────────────────────────────────────────────────── */
+
+    esp_dl_tensor_t input_tensor = {
+        .data   = yolo_input,
+        .shape  = {1, YOLO_INPUT_H, YOLO_INPUT_W, YOLO_INPUT_C},
+        .ndim   = 4,
+        .dtype  = ESP_DL_DTYPE_UINT8,
+    };
+
+    esp_dl_tensor_t *outputs = NULL;
+    int num_outputs = 0;
+
+    ret = esp_dl_model_run(yolo_model, &input_tensor, 1,
+                           &outputs, &num_outputs);
+    if (ret != ESP_OK || outputs == NULL || num_outputs < 1) {
+        ESP_LOGE(TAG, "Model inference failed: 0x%X (num_outputs=%d)",
+                 (unsigned int)ret, num_outputs);
+        return ESP_FAIL;
+    }
+
+    int64_t t_after_infer = esp_timer_get_time();
+
+    /* ───────────────────────────────────────────────────────────
+     * 第 4 步: 后处理 — 提取检测框 + NMS
+     *
+     * 输出格式（取决于模型导出配置）:
+     *
+     *   格式 A — 已解码的检测框:
+     *     output[0]: float数组 shape [N_det][6]
+     *     每行: [x1, y1, x2, y2, confidence, class_id]
+     *     坐标已归一化到 [0,1]，需要 × 图像尺寸
+     *
+     *   格式 B — YOLO 原始输出（需要自己解码）:
+     *     output[0]: [1, 84, 8400] 或类似
+     *     需要 anchor 解码 + sigmoid + NMS
+     *
+     * 这里按格式 A（espdet_pico 默认）处理。
+     * ─────────────────────────────────────────────────────────── */
+
+    esp_dl_tensor_t *det_output = &outputs[0];
+    float *raw_data = (float *)det_output->data;
+
+    /*
+     * 推算检测框数量。
+     * det_output->size = N × 6 × sizeof(float)
+     * → N = size / (6 * 4)
+     */
+    int raw_count = det_output->size / (6 * sizeof(float));
+    if (raw_count > YOLO_MAX_DETECTIONS * 2) {
+        raw_count = YOLO_MAX_DETECTIONS * 2;  /* 截断 */
+    }
+    ESP_LOGD(TAG, "Raw detections before NMS: %d", raw_count);
+
+    /* ── 提取超过置信度阈值的框 ── */
+    float detections[YOLO_MAX_DETECTIONS * 5];
+    int det_count = 0;
+
+    for (int i = 0; i < raw_count && det_count < YOLO_MAX_DETECTIONS; i++) {
+        float x1    = raw_data[i * 6 + 0];
+        float y1    = raw_data[i * 6 + 1];
+        float x2    = raw_data[i * 6 + 2];
+        float y2    = raw_data[i * 6 + 3];
+        float conf  = raw_data[i * 6 + 4];
+        /* float cls = raw_data[i * 6 + 5]; — 单类检测，不需要 */
+
+        if (conf >= YOLO_CONF_THRESHOLD) {
+            int idx = det_count * 5;
+            detections[idx + 0] = x1;
+            detections[idx + 1] = y1;
+            detections[idx + 2] = x2;
+            detections[idx + 3] = y2;
+            detections[idx + 4] = conf;
+            det_count++;
+        }
+    }
+
+    ESP_LOGD(TAG, "Detections above threshold (%.2f): %d",
+             (double)YOLO_CONF_THRESHOLD, det_count);
+
+    /* ── NMS ── */
+    int nms_count = det_count;
+    nms_suppress(detections, &nms_count, YOLO_MAX_DETECTIONS, YOLO_IOU_THRESHOLD);
+
+    ESP_LOGD(TAG, "Detections after NMS: %d", nms_count);
+
+    /* ───────────────────────────────────────────────────────────
+     * 第 5 步: 活跃度追踪
+     * ─────────────────────────────────────────────────────────── */
+
+    tracked_bbox_t cur_bboxes[YOLO_MAX_DETECTIONS];
+    int cur_count = (nms_count < YOLO_MAX_DETECTIONS) ? nms_count : YOLO_MAX_DETECTIONS;
+
+    for (int i = 0; i < cur_count; i++) {
+        float x1 = detections[i * 5 + 0];
+        float y1 = detections[i * 5 + 1];
+        float x2 = detections[i * 5 + 2];
+        float y2 = detections[i * 5 + 3];
+        cur_bboxes[i].cx = (x1 + x2) / 2.0f;
+        cur_bboxes[i].cy = (y1 + y2) / 2.0f;
+        cur_bboxes[i].w  = x2 - x1;
+        cur_bboxes[i].h  = y2 - y1;
+    }
+
+    int motion_score = compute_motion_score_bbox(
+        cur_bboxes, cur_count,
+        prev_bboxes, prev_bbox_count);
+
+    /* ── 保存当前帧（供下次对比）── */
+    memcpy(prev_bboxes, cur_bboxes, cur_count * sizeof(tracked_bbox_t));
+    prev_bbox_count = cur_count;
+
+    /* ───────────────────────────────────────────────────────────
+     * 第 6 步: 填充结果
+     * ─────────────────────────────────────────────────────────── */
+
+    result->fish_count   = cur_count;
+    result->motion_score = motion_score;
+    result->activity     = get_activity_label_yolo(motion_score);
+
+    int64_t t_total_end = esp_timer_get_time();
+
+    ESP_LOGI(TAG, "🐟 Detection: %d fish, %s (score=%d%%) "
+             "[jpeg=%lldms, resize=%lldms, infer=%lldms, total=%lldms]",
+             result->fish_count, result->activity, result->motion_score,
+             (long long)((t_after_jpeg - t_total_start) / 1000),
+             (long long)((t_after_resize - t_after_jpeg) / 1000),
+             (long long)((t_after_infer - t_after_resize) / 1000),
+             (long long)((t_total_end - t_total_start) / 1000));
+
+    return ESP_OK;
+}
+
+#else /* CONFIG_SMART_FISHER_DETECTION_FRAME_DIFF */
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 公开 API — fish_detector_analyze()  [帧差法版本]
+ * ═══════════════════════════════════════════════════════════════════ */
 
 esp_err_t fish_detector_analyze(const uint8_t *jpeg_data, size_t jpeg_len,
                                 fish_result_t *result)
@@ -478,18 +897,10 @@ esp_err_t fish_detector_analyze(const uint8_t *jpeg_data, size_t jpeg_len,
 
     int64_t t_start = esp_timer_get_time();
 
-    /* 初始化结果 */
     memset(result, 0, sizeof(fish_result_t));
     result->activity = "unknown";
 
-    /* ───────────────────────────────────────────────────────────────
-     * 第 1 步：JPEG 解码 → RGB565
-     * ─────────────────────────────────────────────────────────────── */
-
-    /*
-     * 先获取图像信息（宽度、高度、输出 buffer 大小）。
-     * 这一步不解码，只读 JPEG 头部。
-     */
+    /* ── 步骤 1: JPEG 解码 → RGB565 ── */
     esp_jpeg_image_cfg_t jpeg_cfg = {
         .indata = (uint8_t *)jpeg_data,
         .indata_size = (uint32_t)jpeg_len,
@@ -505,116 +916,81 @@ esp_err_t fish_detector_analyze(const uint8_t *jpeg_data, size_t jpeg_len,
     esp_jpeg_image_output_t jpeg_out;
     esp_err_t ret = esp_jpeg_get_image_info(&jpeg_cfg, &jpeg_out);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get JPEG info (err=0x%X)", (unsigned int)ret);
+        ESP_LOGE(TAG, "JPEG info failed: 0x%X", (unsigned int)ret);
         return ESP_FAIL;
     }
 
     int new_width = jpeg_out.width;
     int new_height = jpeg_out.height;
     int new_pixels = new_width * new_height;
-    size_t outbuf_size = new_pixels * 2;   /* RGB565 = 2 bytes/pixel */
+    size_t outbuf_size = new_pixels * 2;
 
-    ESP_LOGD(TAG, "Decoded image: %dx%d, output buffer: %u bytes",
-             new_width, new_height, (unsigned int)outbuf_size);
-
-    /*
-     * 如果图像尺寸变了（不太可能但做个检查），重新分配 buffer。
-     */
+    /* 尺寸变化时重新分配 buffer */
     if (new_pixels != img_pixels) {
-        /* 释放旧 buffer */
-        if (current_gray != NULL) { free(current_gray); current_gray = NULL; }
+        if (current_gray != NULL)   { free(current_gray);   current_gray = NULL; }
         if (reference_gray != NULL) { free(reference_gray); reference_gray = NULL; }
-        if (motion_map != NULL) { free(motion_map); motion_map = NULL; }
-        if (label_map != NULL) { free(label_map); label_map = NULL; }
+        if (motion_map != NULL)     { free(motion_map);     motion_map = NULL; }
+        if (label_map != NULL)      { free(label_map);      label_map = NULL; }
 
         img_width = new_width;
         img_height = new_height;
         img_pixels = new_pixels;
 
-        /* 分配新 buffer */
-        current_gray = (uint8_t *)malloc(img_pixels);
+        current_gray   = (uint8_t *)malloc(img_pixels);
         reference_gray = (uint8_t *)malloc(img_pixels);
-        motion_map = (uint8_t *)malloc(img_pixels);
-        label_map = (uint16_t *)malloc(img_pixels * sizeof(uint16_t));
+        motion_map     = (uint8_t *)malloc(img_pixels);
+        label_map      = (uint16_t *)malloc(img_pixels * sizeof(uint16_t));
 
         if (current_gray == NULL || reference_gray == NULL
             || motion_map == NULL || label_map == NULL) {
-            ESP_LOGE(TAG, "Failed to allocate detection buffers (%d pixels)",
-                     img_pixels);
+            ESP_LOGE(TAG, "Buffer alloc failed (%d pixels)", img_pixels);
             fish_detector_reset();
             return ESP_ERR_NO_MEM;
         }
 
-        /* 清空灰度 buffer */
         memset(current_gray, 0, img_pixels);
         memset(reference_gray, 0, img_pixels);
 
-        ESP_LOGI(TAG, "Detection buffers allocated: %dx%d (%d pixels)",
+        ESP_LOGI(TAG, "Buffers allocated: %dx%d (%d pixels)",
                  img_width, img_height, img_pixels);
     }
 
-    /*
-     * 分配 RGB565 临时输出 buffer。
-     * 这个比较大（100×75×2 = 15KB），用堆分配。
-     */
+    /* 解码 JPEG */
     uint16_t *rgb565_buf = (uint16_t *)malloc(outbuf_size);
     if (rgb565_buf == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate RGB565 buffer (%u bytes)",
+        ESP_LOGE(TAG, "RGB565 buffer alloc failed (%u bytes)",
                  (unsigned int)outbuf_size);
         return ESP_ERR_NO_MEM;
     }
 
-    /* 执行 JPEG 解码 */
     jpeg_cfg.outbuf = (uint8_t *)rgb565_buf;
     jpeg_cfg.outbuf_size = (uint32_t)outbuf_size;
 
     ret = esp_jpeg_decode(&jpeg_cfg, &jpeg_out);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG decode failed (err=0x%X)", (unsigned int)ret);
+        ESP_LOGE(TAG, "JPEG decode failed: 0x%X", (unsigned int)ret);
         free(rgb565_buf);
         return ESP_FAIL;
     }
 
-    /* ───────────────────────────────────────────────────────────────
-     * 第 2 步：RGB565 → 灰度
-     * ─────────────────────────────────────────────────────────────── */
+    /* ── 步骤 2: RGB565 → 灰度 ── */
     convert_to_grayscale(rgb565_buf, current_gray, img_pixels);
-
-    /* RGB565 buffer 用完了，可以释放 */
     free(rgb565_buf);
-    rgb565_buf = NULL;
 
-    /* ───────────────────────────────────────────────────────────────
-     * 第 3 步：帧差（如果有参考帧）
-     * ─────────────────────────────────────────────────────────────── */
-
+    /* ── 步骤 3: 帧差 ── */
     if (!has_reference) {
-        /*
-         * 第一帧：存为参考帧，不做分析。
-         * 下次拍照时才能做差分。
-         */
         memcpy(reference_gray, current_gray, img_pixels);
         has_reference = true;
-
         int64_t t_end = esp_timer_get_time();
-        ESP_LOGI(TAG, "Reference frame stored (%dx%d). "
-                 "Motion detection will start from next capture. "
-                 "Took %lld ms.",
-                 img_width, img_height,
-                 (long long)((t_end - t_start) / 1000));
+        ESP_LOGI(TAG, "Reference frame stored (%dx%d). Took %lld ms.",
+                 img_width, img_height, (long long)((t_end - t_start) / 1000));
         return ESP_OK;
     }
 
-    /*
-     * 比较当前帧和参考帧。
-     */
     int motion_pixels = compute_frame_diff(current_gray, reference_gray,
                                            motion_map, img_pixels);
 
-    /* ───────────────────────────────────────────────────────────────
-     * 第 4 步：连通域分析 → 估算鱼的数量
-     * ─────────────────────────────────────────────────────────────── */
-
+    /* ── 步骤 4: 连通域分析 ── */
     int fish_count = 0;
     if (motion_pixels >= MIN_FISH_AREA) {
         fish_count = find_connected_components(motion_map, label_map,
@@ -622,28 +998,20 @@ esp_err_t fish_detector_analyze(const uint8_t *jpeg_data, size_t jpeg_len,
                                                MAX_FISH_COUNT);
     }
 
-    /* ───────────────────────────────────────────────────────────────
-     * 第 5 步：计算运动分数和活跃度
-     * ─────────────────────────────────────────────────────────────── */
-
-    int motion_score = (motion_pixels * 100) / img_pixels;   /* 百分比 */
+    /* ── 步骤 5: 计算分数 ── */
+    int motion_score = (motion_pixels * 100) / img_pixels;
     const char *activity = get_activity_label(motion_score);
 
-    /* ───────────────────────────────────────────────────────────────
-     * 更新参考帧（当前帧变为下次的参考帧）
-     * ─────────────────────────────────────────────────────────────── */
+    /* ── 更新参考帧 ── */
     memcpy(reference_gray, current_gray, img_pixels);
 
-    /* ───────────────────────────────────────────────────────────────
-     * 输出结果
-     * ─────────────────────────────────────────────────────────────── */
-
-    result->fish_count = fish_count;
+    /* ── 输出 ── */
+    result->fish_count   = fish_count;
     result->motion_score = motion_score;
-    result->activity = activity;
+    result->activity     = activity;
 
     int64_t t_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "🐟 Detection: %d fish, activity=%s (score=%d%%, "
+    ESP_LOGI(TAG, "🐟 Detection: %d fish, %s (score=%d%%, "
              "motion_pixels=%d) [%lld ms]",
              fish_count, activity, motion_score, motion_pixels,
              (long long)((t_end - t_start) / 1000));
@@ -651,22 +1019,24 @@ esp_err_t fish_detector_analyze(const uint8_t *jpeg_data, size_t jpeg_len,
     return ESP_OK;
 }
 
+#endif /* CONFIG_SMART_FISHER_DETECTION_YOLO / FRAME_DIFF */
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 公开 API — fish_detector_reset()
+ * ═══════════════════════════════════════════════════════════════════ */
+
 void fish_detector_reset(void)
 {
     ESP_LOGI(TAG, "Resetting detector state");
 
+#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO
+    memset(prev_bboxes, 0, sizeof(prev_bboxes));
+    prev_bbox_count = 0;
+#else
     has_reference = false;
-
-    if (reference_gray != NULL) {
-        memset(reference_gray, 0, img_pixels);
-    }
-    if (current_gray != NULL) {
-        memset(current_gray, 0, img_pixels);
-    }
-    if (motion_map != NULL) {
-        memset(motion_map, 0, img_pixels);
-    }
-    if (label_map != NULL) {
-        memset(label_map, 0, img_pixels * sizeof(uint16_t));
-    }
+    if (reference_gray != NULL) memset(reference_gray, 0, img_pixels);
+    if (current_gray != NULL)   memset(current_gray, 0, img_pixels);
+    if (motion_map != NULL)     memset(motion_map, 0, img_pixels);
+    if (label_map != NULL)      memset(label_map, 0, img_pixels * sizeof(uint16_t));
+#endif
 }

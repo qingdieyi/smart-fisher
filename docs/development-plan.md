@@ -81,8 +81,8 @@ PWDN     → -1 (unused)
 | 任务名 | 栈大小 | 优先级 | 周期 | 职责 | 状态 |
 |--------|--------|--------|------|------|------|
 | `temp_task` | 4096 | 3 | 每 5 秒 | 读取 DS18B20，串口输出温度 | ✅ 已实现 |
-| `camera_capture_task` | 8192 | 2 | 每 5 分钟 | 拍摄照片 → 分析 → 发布 MQTT | ⬜ 待实现 |
-| `mqtt_task` | 6144 | 4 | 事件驱动 | MQTT 连接管理 + 消息发布 | ⬜ 待实现 |
+| `camera_capture_task` | 8192 | 2 | 每 60 秒 | 拍照 → 鱼群检测 → MQTT 上报 | ✅ 已实现 |
+| `mqtt_task` | ESP-MQTT 内部任务 | 自动 | 事件驱动 | MQTT 连接管理 + 消息发布 | ✅ 已实现 |
 
 > **注意**：实际实现与原始设计有差异。WiFi 重连逻辑在事件回调 `wifi_event_handler()` 中处理（而非独立任务），`main.c` 的主循环作为空闲任务运行（而非独立的 wifi_reconnect_task）。
 
@@ -307,30 +307,43 @@ CONFIG_EXAMPLE_WPA2_ENTERPRISE=n
 >
 > **实现决策**：使用 `idf_component.yml` 声明 `espressif/esp32-camera` 依赖。摄像头初始化在 `camera_task` 内部完成（非 `app_main`），失败后每 30 秒重试，不影响温度采集。引脚映射与原理图和参考程序 100% 对齐。
 
-### 第四阶段：MQTT 上报（1~2天）
+### 第四阶段：MQTT 上报（1~2天）✅ 已完成
 
-- [ ] 集成 `esp-mqtt` 组件
-- [ ] 连接公共 MQTT Broker
-- [ ] 上报温度数据（JSON 格式）
-- [ ] 上报 JPEG 图片
-- [ ] 实现 LWT（Last Will Testament）在线/离线状态
-- [ ] 使用 MQTTX 或手机 App 验证数据接收
+- [x] 集成 `esp-mqtt` 组件
+- [x] 创建 `mqtt_handler.h/c` 封装层
+- [x] 连接公共 MQTT Broker (`broker.emqx.io:1883`)
+- [x] 设备 ID 基于 MAC 地址后 3 字节（如 `A1B2C3`）
+- [x] 异步发布 API：`mqtt_publish()` / `mqtt_publish_binary()`
+- [x] 自动重连（ESP-MQTT 内置机制）
+- [x] 4 个 Topic: temperature / fish_status / image / status
+- [x] 使用 MQTTX 或手机 App 验证数据接收
 
-### 第五阶段：鱼群检测（3~5天）
+### 第五阶段：鱼群检测（3~5天）✅ 已完成
 
-- [ ] 实现帧差法运动检测算法
-- [ ] 调试运动区域分割阈值
-- [ ] 连通域分析 → 估算鱼数
-- [ ] 运动像素比例 → 判定活跃度
-- [ ] 上报分析结果到 MQTT
-- [ ] 可选：将检测结果标记在原图上输出
+- [x] 帧差法引擎：JPEG 解码 → 灰度 → 差分 → 连通域分析 → 计数+活跃度
+- [x] YOLO 引擎（ESP-DL）：代码就绪，模型待 PC 端训练
+- [x] 双引擎 `#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO` 切换
+- [x] `fish_result_t` API 不变，上层 `main.c` 零修改
+- [x] YOLO 管线：JPEG → RGB565 → 224×224 RGB888 (双线性插值) → ESP-DL 推理 → NMS
+- [x] 活跃度追踪：YOLO 模式用 bbox 质心位移 (最近邻匹配)
+- [x] 上报分析结果到 MQTT (`fish_status` topic)
 
-### 第六阶段：稳定与优化（2~3天）
+### 第六阶段：YOLO 模型训练与部署（待执行）
+
+- [ ] 鱼缸照片采集（200~500 张，不同时间、密度、光照）
+- [ ] LabelImg 标注（每条鱼画 bbox，输出 YOLO 格式）
+- [ ] ESP-Detection 训练 + INT8 量化（`python espdet_run.py`）
+- [ ] 模型文件 `espdet_pico_fish.espdl` 放入 `main/models/`
+- [ ] menuconfig 切换为 `CONFIG_SMART_FISHER_DETECTION_YOLO`
+- [ ] 编译测试 + 真实鱼缸验证 + 与帧差法对比
+
+> 📖 详细指南：`docs/yolo-practical-guide.md`（标注→训练→部署全流程）
+
+### 第七阶段：稳定与优化（待执行）
 
 - [ ] 内存泄漏检查（长时间运行，监控 free heap）
 - [ ] 看门狗保护（Task WDT + 中断 WDT）
 - [ ] OTA 远程升级支持
-- [ ] HTTP 图片上传作为备选通道（图片过大时分段）
 - [ ] 功耗优化（可选 deep-sleep，非必需）
 
 ---

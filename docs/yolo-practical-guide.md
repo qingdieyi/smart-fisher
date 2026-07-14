@@ -1,5 +1,7 @@
 # YOLO 鱼群检测：标注→训练→部署 实操指南
 
+> 📌 **关联文档**: 技术方案 → [`esp-dl-yolo-plan.md`](esp-dl-yolo-plan.md) | 项目代码 → `main/fish_detector.c` (YOLO 部分) | 配置 → `main/Kconfig.projbuild` (SMART_FISHER_DETECTION_YOLO)
+
 ## 目录
 
 1. [标注原理：模型到底学到了什么](#1-标注原理)
@@ -427,29 +429,41 @@ smart-fisher/
 │   └── ...
 ```
 
-### 6.2 CMake 配置
+### 6.2 CMake 配置（代码已就绪 ✅）
 
-`main/CMakeLists.txt` 添加：
+`main/CMakeLists.txt` 已包含条件模型嵌入逻辑——不需要手动修改。启用 `CONFIG_SMART_FISHER_DETECTION_YOLO` 后自动激活：
 
 ```cmake
-# 将模型文件嵌入固件（放在 Flash .rodata 段）
-target_add_binary_data(
-    ${COMPONENT_LIB}
-    "models/espdet_pico_fish.espdl"
-    BINARY
-)
-
-idf_component_register(
-    SRCS "main.c" "ds18b20.c" "camera_handler.c"
-         "mqtt_handler.c" "fish_detector.c"
-    INCLUDE_DIRS "."
-    PRIV_REQUIRES esp_wifi nvs_flash esp_driver_gpio
-                  esp32-camera esp_timer esp_mqtt esp_jpeg esp_dl
-    EMBED_TXTFILES "models/espdet_pico_fish.espdl"
-)
+# main/CMakeLists.txt (已实现，无需修改)
+if(CONFIG_SMART_FISHER_DETECTION_YOLO)
+    set(YOLO_MODEL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/models/espdet_pico_fish.espdl")
+    if(EXISTS "${YOLO_MODEL_PATH}")
+        target_add_binary_data(${COMPONENT_LIB} "${YOLO_MODEL_PATH}" BINARY)
+        message(STATUS "YOLO model embedded: ${YOLO_MODEL_PATH}")
+    else()
+        message(WARNING "YOLO model file not found. See docs/yolo-practical-guide.md")
+    endif()
+endif()
 ```
 
-### 6.3 fish_detector.c 改造
+**Kconfig 配置**也在 `main/Kconfig.projbuild` 中预先定义好了：
+
+- `CONFIG_SMART_FISHER_DETECTION_YOLO` — 切换检测引擎
+- `CONFIG_SMART_FISHER_YOLO_CONFIDENCE_THRESHOLD` — 置信度阈值 (默认 0.50)
+- `CONFIG_SMART_FISHER_YOLO_IOU_THRESHOLD` — IoU 阈值 (默认 0.45)
+
+通过 `idf.py menuconfig → Smart Fisher Configuration` 修改。
+
+### 6.3 fish_detector.c — 代码已就绪 ✅
+
+YOLO 推理管线的完整实现已在 `main/fish_detector.c` 中（`#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO` 块内），包括：
+
+- JPEG → RGB565 → 224×224 RGB888 预处理 (双线性插值)
+- ESP-DL 模型加载 + 推理调用
+- NMS 非极大值抑制后处理
+- 基于 bbox 质心位移的活跃度追踪
+
+**不需要手动编写任何代码**——启用 Kconfig 选项后，编译系统自动选择 YOLO 引擎。下面是核心代码的结构概览（供理解，非需要手写）：
 
 ```c
 #include "fish_detector.h"
@@ -608,20 +622,38 @@ idf.py -p COM8 flash monitor
 
 ## 8. 快速检查清单
 
-准备开始标注前，确认：
+### 准备工作
 
 - [ ] 已从鱼缸拍了 **200+ 张照片**（不同时间、不同鱼数）
 - [ ] 已安装 LabelImg（或注册 Roboflow）
 - [ ] 已搭建 ESP-Detection Python 环境
 - [ ] 已理解 YOLO 标注格式：`class cx cy w h`
 - [ ] 知道怎么打开串口看 ESP32 日志
-- [ ] ESP-IDF 已安装 esp-dl 组件
 
-一切就绪后，实际工作流为：
+### 训练完成后的部署
+
+- [ ] `espdet_pico_fish.espdl` 已放入 `main/models/`
+- [ ] `idf_component.yml` 中 `espressif/esp-dl` 依赖已启用
+- [ ] `idf.py menuconfig → Smart Fisher Configuration → Fish Detection Method → YOLO Object Detection`
+- [ ] `idf.py fullclean && idf.py build` 编译通过
+- [ ] 固件烧录后串口日志显示 "YOLO model loaded successfully"
+- [ ] MQTTX 订阅 `smart-fisher/+/fish_status` 验证检测结果
+
+### 实际工作流
 
 ```
 Day 1~2:  标注 200~500 张照片
 Day 3:    训练模型（CPU 4h / GPU 1h）
-Day 3~4:  集成到 fish_detector.c + 编译测试
-Day 5:    在真实鱼缸上验证 + 微调阈值
+Day 3~4:  放置模型 + menuconfig 切换 + 编译测试
+Day 5:    在真实鱼缸上验证 + 与帧差法对比
 ```
+
+### 关键文件速查
+
+| 文件 | 作用 |
+|------|------|
+| `main/fish_detector.c` | YOLO 推理代码 (已实现, `#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO`) |
+| `main/Kconfig.projbuild` | 检测引擎选择 + 置信度/IoU 阈值配置 |
+| `main/CMakeLists.txt` | 条件模型嵌入 (`target_add_binary_data`) |
+| `main/idf_component.yml` | `espressif/esp-dl` 依赖声明 |
+| `sdkconfig.defaults` | 默认帧差法，YOLO 注释掉待启用 |

@@ -4,6 +4,8 @@
 
 用 YOLO 目标检测模型替换现有的帧差法（`fish_detector.c`），在 ESP32-S3 芯片内部完成神经网络推理。不依赖云端 GPU，不消耗网络流量，推理在本地完成。
 
+> 📌 **实现状态**：YOLO 代码已全部就绪（`main/fish_detector.c`，`#ifdef CONFIG_SMART_FISHER_DETECTION_YOLO`），双引擎通过 Kconfig 切换。待 PC 端完成模型训练后将 `.espdl` 文件放入 `main/models/` 即可启用。详见 [`yolo-practical-guide.md`](yolo-practical-guide.md)。
+
 > 📖 **配套实操指南**：[`yolo-practical-guide.md`](yolo-practical-guide.md) — 标注工具使用、YOLO 格式原理、训练命令详解、模型部署代码示例。
 
 ---

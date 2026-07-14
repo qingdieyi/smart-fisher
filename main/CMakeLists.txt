@@ -22,27 +22,40 @@
 #
 # ═══════════════════════════════════════════════════════════════════
 
+# ── 模型文件嵌入（仅在启用 YOLO 时） ───────────────────────────────
+#
+# 将 .espdl 模型文件作为二进制数据嵌入固件。
+# 编译后可通过 extern 符号访问模型数据：
+#
+#   extern const uint8_t _binary_models_espdet_pico_fish_espdl_start[];
+#   extern const uint8_t _binary_models_espdet_pico_fish_espdl_end[];
+#
+# 如果模型文件不存在，编译会报 "file not found"。
+# 此时注释掉下面这行，或先完成模型训练（见 docs/yolo-practical-guide.md）。
+if(CONFIG_SMART_FISHER_DETECTION_YOLO)
+    set(YOLO_MODEL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/models/espdet_pico_fish.espdl")
+    if(EXISTS "${YOLO_MODEL_PATH}")
+        target_add_binary_data(${COMPONENT_LIB} "${YOLO_MODEL_PATH}" BINARY)
+        message(STATUS "YOLO model embedded: ${YOLO_MODEL_PATH}")
+    else()
+        message(WARNING "YOLO model file not found at: ${YOLO_MODEL_PATH}")
+        message(WARNING "Place the trained .espdl model there, or switch to Frame Differencing.")
+        message(WARNING "See: docs/yolo-practical-guide.md")
+    endif()
+endif()
+
+# ── 条件依赖：YOLO 模式需要 ESP-DL ────────────────────────────────
+set(EXTRA_PRIV_REQUIRES "")
+if(CONFIG_SMART_FISHER_DETECTION_YOLO)
+    list(APPEND EXTRA_PRIV_REQUIRES esp_dl)
+    message(STATUS "Fish Detection: YOLO mode (ESP-DL required)")
+else()
+    message(STATUS "Fish Detection: Frame Differencing mode")
+endif()
+
 # idf_component_register() — 注册当前目录为一个 ESP-IDF 组件
 idf_component_register(
-    # SRCS: 源文件列表（类似 Maven 的 <sourceDirectory>）
-    #       列出所有要编译的 .c 文件
     SRCS "main.c" "ds18b20.c" "camera_handler.c" "mqtt_handler.c" "fish_detector.c"
-
-    # INCLUDE_DIRS: 头文件搜索路径
-    #               "." 表示当前目录，这样 #include "ds18b20.h" 就能找到
-    #               类似 Java 的 classpath
     INCLUDE_DIRS "."
-
-    # PRIV_REQUIRES: 私有依赖（只在当前组件内部使用）
-    #   类似 Maven 的 <scope>runtime</scope>
-    #
-    #   我们依赖的 ESP-IDF 组件：
-    #     - esp_wifi:       WiFi 驱动和相关 API
-    #     - nvs_flash:      非易失性存储（存 WiFi 凭证）
-    #     - esp_driver_gpio: GPIO 驱动（ESP-IDF v6.0 拆分出的独立组件）
-    #     - esp32-camera:   OV5640 摄像头驱动（来自 Component Registry）
-    #     - esp_timer:      高精度定时器（获取拍照时间戳）
-    #     - esp_mqtt:       MQTT 客户端（数据上报到云端 Broker）
-    #     - esp_jpeg:       JPEG 解码器（鱼群检测需要解码照片）
-    PRIV_REQUIRES esp_wifi nvs_flash esp_driver_gpio esp32-camera esp_timer esp_mqtt esp_jpeg
+    PRIV_REQUIRES esp_wifi nvs_flash esp_driver_gpio esp32-camera esp_timer esp_mqtt esp_jpeg ${EXTRA_PRIV_REQUIRES}
 )

@@ -31,13 +31,10 @@
 # ── WiFi 配置 ─────────────────────────────────────────────────────
 
 # WiFi 网络名称（SSID）
-CONFIG_EXAMPLE_WIFI_SSID="yang"
+CONFIG_SMART_FISHER_WIFI_SSID="yang"
 
 # WiFi 密码
-CONFIG_EXAMPLE_WIFI_PASSWORD="yang123456"
-
-# 使用 WPA2-PSK 认证模式（最常见的家用 WiFi 加密）
-CONFIG_EXAMPLE_WPA2_ENTERPRISE=n
+CONFIG_SMART_FISHER_WIFI_PASSWORD="yang123456"
 
 # ── PSRAM 配置（摄像头必须！） ────────────────────────────────────
 #
@@ -57,7 +54,6 @@ CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 
 # 将 PSRAM 加入 malloc 分配池
-# 这样 camera 组件可以通过 heap_caps_malloc(..., MALLOC_CAP_SPIRAM) 分配帧缓冲
 CONFIG_SPIRAM_USE_MALLOC=y
 
 # 不允许 BSS 段放 PSRAM（和参考程序一致，避免初始化顺序问题）
@@ -66,11 +62,33 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # SCCB (I²C) 时钟频率 — 最低 100kHz，提高稳定性
 CONFIG_SCCB_CLK_FREQ=100000
 
+# ── 鱼群检测方式 ──────────────────────────────────────────────────
+#
+# 默认使用帧差法（不需要模型文件，不需要 ESP-DL）
+# 切换到 YOLO 的步骤:
+#   1. 训练模型: 参照 docs/yolo-practical-guide.md
+#   2. 放置模型: main/models/espdet_pico_fish.espdl
+#   3. 启用: idf.py menuconfig → Smart Fisher Configuration
+#           → Fish Detection Method → YOLO Object Detection
+#   4. 添加依赖: idf_component.yml 中取消 espressif/esp-dl 的注释
+#   5. 重新编译: idf.py fullclean && idf.py build
+
+# 帧差法 — 不需要外部依赖，默认启用
+CONFIG_SMART_FISHER_DETECTION_FRAME_DIFF=y
+
+# YOLO — 取消下面注释来启用（需要完成上述准备步骤）
+# CONFIG_SMART_FISHER_DETECTION_YOLO=y
+# CONFIG_SMART_FISHER_YOLO_MODEL_PATH="main/models/espdet_pico_fish.espdl"
+# CONFIG_SMART_FISHER_YOLO_CONFIDENCE_THRESHOLD=0.50
+# CONFIG_SMART_FISHER_YOLO_IOU_THRESHOLD=0.45
+
 # ── MQTT 配置 ──────────────────────────────────────────────────────
 
 # MQTT Broker 地址（公共测试 Broker，免费无需注册）
 # 取消注释以覆盖默认值:
 # CONFIG_BROKER_URI="mqtt://broker.emqx.io:1883"
+
+# ── 其他 ──────────────────────────────────────────────────────────
 
 # 开启 Task Watchdog（任务看门狗 — 如果任务卡死超 10 秒，自动重启）
 # CONFIG_ESP_TASK_WDT=y
